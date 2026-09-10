@@ -1,0 +1,2 @@
+[console_scripts]
+ifp-contract = ifp_contract.cli:main

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifp-contract-slicer"
+version = "0.1.0"
+description = "Bounded-memory Data Integrator reference and OData mapping extractor"
+requires-python = ">=3.11"
+
+[project.scripts]
+ifp-contract = "ifp_contract.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
