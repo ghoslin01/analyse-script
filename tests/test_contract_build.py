@@ -29,6 +29,7 @@ def test_build_keeps_only_direct_odata_contracts_and_caller_mappings(tmp_path):
     Result_ClassType="ComponentMapping"
     Result_SolutionDataItemMapping="Screen.CustomerName"
     Result_PropertyKey="Response.Customers[0].Name" Result_Out="true" />
+  <Rule eid="not-a-call" RuleClassName="AssignRule">WraDataIntegrator.ifp</Rule>
 </Project>""",
         encoding="utf-8",
     )

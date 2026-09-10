@@ -236,7 +236,12 @@ def iter_caller_references(
     with file_path.open("rb") as attributes_handle:
         for occurrence in iter_occurrence_offsets(file_path, needle):
             span = tag_span_containing(file_path, occurrence)
-            if span is None or span.start in seen_tag_offsets or not _is_rule(span):
+            if (
+                span is None
+                or occurrence + len(needle) > span.end
+                or span.start in seen_tag_offsets
+                or not _is_rule(span)
+            ):
                 continue
             seen_tag_offsets.add(span.start)
             attributes = read_selected_attributes(
