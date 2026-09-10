@@ -153,6 +153,30 @@ def iter_start_tags(
 AttributeWanted = Callable[[str], bool]
 
 
+class TagScanLimitExceeded(ValueError):
+    """Raised when a malformed/unclosed start tag exceeds the safety window."""
+
+
+class UnsupportedIFPEncoding(ValueError):
+    """Raised instead of silently missing references in unsupported XML bytes."""
+
+
+def ensure_supported_encoding(path: str | Path) -> None:
+    """Reject UTF-16 IFP input explicitly; the byte slicer currently uses UTF-8."""
+
+    with Path(path).open("rb") as handle:
+        prefix = handle.read(4)
+    utf16_bom = prefix.startswith((b"\xff\xfe", b"\xfe\xff"))
+    utf16_pattern = len(prefix) >= 2 and (
+        (prefix[0] == ord("<") and prefix[1] == 0)
+        or (prefix[0] == 0 and prefix[1] == ord("<"))
+    )
+    if utf16_bom or utf16_pattern:
+        raise UnsupportedIFPEncoding(
+            f"UTF-16 IFP is not supported by the byte slicer: {path}; convert/export it as UTF-8"
+        )
+
+
 def read_selected_attributes(
     path: str | Path,
     start: int,
@@ -283,20 +307,11 @@ def contains_bytes(
 ) -> bool:
     """Return whether a file contains ``needle`` using a bounded byte stream."""
 
-    if not needle:
-        return False
-    prefix_table = _lps(needle)
-    match_index = 0
-    with Path(path).open("rb") as handle:
-        while block := handle.read(chunk_size):
-            for value in block:
-                while match_index and value != needle[match_index]:
-                    match_index = prefix_table[match_index - 1]
-                if value == needle[match_index]:
-                    match_index += 1
-                    if match_index == len(needle):
-                        return True
-    return False
+    matches = iter_occurrence_offsets(path, needle, chunk_size=chunk_size)
+    try:
+        return next(matches, None) is not None
+    finally:
+        matches.close()
 
 
 def iter_occurrence_offsets(
@@ -304,25 +319,89 @@ def iter_occurrence_offsets(
     needle: bytes,
     *,
     chunk_size: int = 1024 * 1024,
+    on_bytes: Callable[[int], None] | None = None,
 ) -> Iterator[int]:
-    """Yield every byte offset where ``needle`` begins, with O(1) file memory."""
+    """Yield every byte offset where ``needle`` begins, with O(1) file memory.
+
+    The search itself runs inside CPython's C implementation of
+    :meth:`bytes.find`; Python only handles actual matches and chunk
+    boundaries.  That distinction matters when normal inputs are hundreds of
+    megabytes or several gigabytes.
+    """
 
     if not needle:
         return
-    prefix_table = _lps(needle)
-    match_index = 0
-    offset = 0
+    overlap_size = max(0, len(needle) - 1)
+    overlap = b""
+    bytes_read = 0
     with Path(path).open("rb") as handle:
         while block := handle.read(chunk_size):
-            for value in block:
-                while match_index and value != needle[match_index]:
-                    match_index = prefix_table[match_index - 1]
-                if value == needle[match_index]:
-                    match_index += 1
-                    if match_index == len(needle):
-                        yield offset - len(needle) + 1
-                        match_index = prefix_table[match_index - 1]
-                offset += 1
+            window = overlap + block
+            window_start = bytes_read - len(overlap)
+            search_at = 0
+            while True:
+                found = window.find(needle, search_at)
+                if found < 0:
+                    break
+                yield window_start + found
+                search_at = found + 1
+            bytes_read += len(block)
+            if on_bytes is not None:
+                on_bytes(bytes_read)
+            overlap = window[-overlap_size:] if overlap_size else b""
+
+
+def iter_target_start_tags(
+    path: str | Path,
+    tag_names: tuple[bytes, ...],
+    *,
+    chunk_size: int = 1024 * 1024,
+    handle: BinaryIO | None = None,
+) -> Iterator[TagSpan]:
+    """Find selected unprefixed XML start tags using C-level byte searches.
+
+    IFP exports use stable, case-sensitive tag names such as ``Rule`` and
+    ``DataSource``. All requested names share one sequential pass; only actual
+    candidates invoke the quote-aware tag boundary scanner.
+    """
+
+    file_path = Path(path)
+    own_handle = handle is None
+    reader = handle or file_path.open("rb")
+    needles = tuple((b"<" + name, name) for name in tag_names)
+    overlap_size = max((len(needle) - 1 for needle, _ in needles), default=0)
+    try:
+        overlap = b""
+        bytes_read = 0
+        with file_path.open("rb") as scanner:
+            while block := scanner.read(chunk_size):
+                window = overlap + block
+                window_start = bytes_read - len(overlap)
+                candidates: list[tuple[int, bytes]] = []
+                for needle, tag_name in needles:
+                    search_at = 0
+                    while True:
+                        found = window.find(needle, search_at)
+                        if found < 0:
+                            break
+                        absolute = window_start + found
+                        # Matches wholly inside overlap were emitted with the
+                        # previous block; crossing matches are new.
+                        if not bytes_read or absolute + len(needle) > bytes_read:
+                            candidates.append((absolute, tag_name))
+                        search_at = found + 1
+                for offset, tag_name in sorted(candidates):
+                    span = tag_span_containing(file_path, offset + 1, handle=reader)
+                    if span is None or span.start != offset:
+                        continue
+                    if span.name.encode("utf-8", "replace") != tag_name:
+                        continue
+                    yield span
+                bytes_read += len(block)
+                overlap = window[-overlap_size:] if overlap_size else b""
+    finally:
+        if own_handle:
+            reader.close()
 
 
 def tag_span_containing(
@@ -330,6 +409,8 @@ def tag_span_containing(
     offset: int,
     *,
     chunk_size: int = 256 * 1024,
+    handle: BinaryIO | None = None,
+    max_tag_bytes: int = 512 * 1024 * 1024,
 ) -> TagSpan | None:
     """Find the XML start tag that contains a known byte offset.
 
@@ -340,13 +421,15 @@ def tag_span_containing(
     """
 
     file_path = Path(path)
-    with file_path.open("rb") as handle:
+    own_handle = handle is None
+    reader = handle or file_path.open("rb")
+    try:
         cursor = offset
         tag_start: int | None = None
         while cursor > 0:
             begin = max(0, cursor - chunk_size)
-            handle.seek(begin)
-            block = handle.read(cursor - begin)
+            reader.seek(begin)
+            block = reader.read(cursor - begin)
             found = block.rfind(b"<")
             if found >= 0:
                 tag_start = begin + found
@@ -355,17 +438,24 @@ def tag_span_containing(
         if tag_start is None:
             return None
 
-        handle.seek(tag_start)
+        reader.seek(tag_start)
         state = "open"
         quote: int | None = None
         name = bytearray()
-        position = tag_start
-        while block := handle.read(chunk_size):
-            for value in block:
+        scanned = 0
+        while scanned < max_tag_bytes:
+            block = reader.read(min(chunk_size, max_tag_bytes - scanned))
+            if not block:
+                return None
+            block_start = tag_start + scanned
+            index = 0
+            while index < len(block):
+                value = block[index]
                 if state == "open":
                     if value != ord("<"):
                         return None
                     state = "after_lt"
+                    index += 1
                 elif state == "after_lt":
                     if value in (ord("<"), ord("/"), ord("!"), ord("?"), ord(">")):
                         return None
@@ -373,6 +463,7 @@ def tag_span_containing(
                         return None
                     name.append(value)
                     state = "tag_name"
+                    index += 1
                 elif state == "tag_name":
                     if value in b" \t\r\n/>":
                         state = "in_tag"
@@ -380,22 +471,42 @@ def tag_span_containing(
                             return TagSpan(
                                 name=name.decode("utf-8", "replace"),
                                 start=tag_start,
-                                end=position + 1,
+                                end=block_start + index + 1,
                                 contains_needle=True,
                             )
                     elif len(name) < 256:
                         name.append(value)
-                elif quote is None:
-                    if value in (ord('"'), ord("'")):
-                        quote = value
-                    elif value == ord(">"):
+                    index += 1
+                elif quote is not None:
+                    found = block.find(bytes((quote,)), index)
+                    if found < 0:
+                        index = len(block)
+                    else:
+                        quote = None
+                        index = found + 1
+                else:
+                    double_quote = block.find(b'"', index)
+                    single_quote = block.find(b"'", index)
+                    closing = block.find(b">", index)
+                    positions = [item for item in (double_quote, single_quote, closing) if item >= 0]
+                    if not positions:
+                        index = len(block)
+                        continue
+                    found = min(positions)
+                    value = block[found]
+                    if value == ord(">"):
                         return TagSpan(
                             name=name.decode("utf-8", "replace"),
                             start=tag_start,
-                            end=position + 1,
+                            end=block_start + found + 1,
                             contains_needle=True,
                         )
-                elif value == quote:
-                    quote = None
-                position += 1
-    return None
+                    quote = value
+                    index = found + 1
+            scanned += len(block)
+        raise TagScanLimitExceeded(
+            f"XML start tag at byte {tag_start} exceeds {max_tag_bytes} bytes or is not closed"
+        )
+    finally:
+        if own_handle:
+            reader.close()

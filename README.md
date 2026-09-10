@@ -34,7 +34,6 @@ If PowerShell blocks activation, run the final command as
 ```powershell
 ifp-contract build D:\ifp-corpus `
   --integrator D:\ifp-corpus\Integration\WraDataIntegrator.ifp `
-  --reference WraDataIntegrator.ifp `
   --db D:\tmp\data-contracts.db
 
 ifp-contract report --db D:\tmp\data-contracts.db --format markdown
@@ -50,19 +49,42 @@ ifp-contract report --db D:\tmp\data-contracts.db --format markdown `
 `build` makes the only corpus pass. `report` reads the small SQLite database;
 it does not scan the IFP corpus again.
 
-`--reference` must be an exact stable string used by callers, normally the
-Data Integrator IFP filename or its `SelectComponent` path fragment.
+`--reference` is optional. By default it uses the Data Integrator filename
+(`WraDataIntegrator.ifp`). Supply it only when callers contain a different or
+more specific path fragment, for example
+`--reference Integration/WraDataIntegrator.ifp`.
+
+During large scans the command prints the current file, MiB read, and average
+MiB/s every few seconds. Use `--quiet` to disable progress. Use `--strict` when
+CI should return exit code 2 for unknown/unclassified evidence; the evidence is
+still saved to SQLite and included in the report.
 
 ## Storage contract
 
 SQLite stores only:
 
 - OData/IRIS rule declarations from the selected Data Integrator file;
+- API/OData DataSource declarations and base endpoints;
 - caller Rule tags containing the reference string;
 - flattened CallComponent mapping attributes from those matching tags.
+- unknown Rule/reference evidence and its exact file byte offset.
 
 The original IFP files remain the source of truth.  A 4 GB corpus is scanned
 as bytes to find the reference, but is never materialised or semantically
 indexed as a global XML graph. For an exact reference hit, the extractor seeks
 back to the containing XML start tag and reads just that tag's selected
 attributes—there is no second full parse of a candidate IFP.
+
+Unknown/custom `RuleClassName` values do not abort extraction. Rules with a
+direct component selector are retained as confirmed reference evidence;
+API-shaped custom Rules are retained as structural candidates. Ambiguous,
+unclassified, malformed, and unsupported-encoding evidence is written to the
+`diagnostics` table and the report's `Unknown / unresolved evidence` section.
+
+The opt-in large-file test uses a generated caller IFP and validates the full
+SQLite build path with bounded memory:
+
+```powershell
+$env:IFP_LARGE_TEST_MB=256
+python -m pytest -q -s tests/test_large_streaming.py
+```
