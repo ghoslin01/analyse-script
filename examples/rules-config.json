@@ -1,0 +1,17 @@
+{
+  "api_rule_classes": [
+    "vendor.SpecialApiRule"
+  ],
+  "component_rule_classes": [
+    "vendor.SpecialComponentCallRule"
+  ],
+  "non_api_rule_classes": [
+    "vendor.KnownLocalRule"
+  ],
+  "attribute_aliases": {
+    "method": ["Verb"],
+    "path": ["Route"],
+    "output": ["ReplyDataGroup"],
+    "selector": ["TargetModule"]
+  }
+}

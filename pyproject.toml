@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ifp-contract-slicer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Bounded-memory Data Integrator reference and OData mapping extractor"
 requires-python = ">=3.11"
 

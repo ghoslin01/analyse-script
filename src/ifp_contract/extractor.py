@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+import hashlib
+import json
+from os import stat_result
 from pathlib import Path
+import re
 
+from .config import DEFAULT_RULE_CONFIG, RuleConfig
 from .store import ContractStore
-from .stream import (
-    TagSpan,
-    ensure_supported_encoding,
-    iter_occurrence_offsets,
-    iter_target_start_tags,
-    read_selected_attributes,
+from .xmlbytes import (
+    AttributeRead,
+    MalformedXMLStructure,
     TagScanLimitExceeded,
     UnsupportedIFPEncoding,
-    tag_span_containing,
+    XMLTagSpan,
+    detect_xml_encoding,
+    find_tag_span,
+    iter_xml_visible_matches,
+    read_tag_attributes,
 )
 
 
@@ -41,29 +47,51 @@ MAPPING_SUFFIXES = (
     "_PropertyKey", "_In", "_Out", "_PubIn", "_PubOut", "_readMapping",
     "_writeMapping", "_Mapping",
 )
-REFERENCE_ATTRIBUTE_NAMES = frozenset(
-    name.casefold()
-    for name in (
-        "SelectComponent", "ComponentList", "Component", "ComponentName",
-        "ComponentPath", "CallComponent", "TargetComponent", "Source", "SourceName",
-    )
-)
-KNOWN_API_RULES = frozenset({"InvokeIRISRule", "SwaggerIntegrationRule"})
-KNOWN_COMPONENT_RULES = frozenset({"CallComponentRule", "BroadcastRule"})
-KNOWN_NON_API_RULES = frozenset(
-    {
-        "CompareMultiListValuesRule", "ContainerRule", "EvaluateRule", "ExpressionRule",
-        "GotoRule", "RepeatRule", "SetValueRule",
-    }
-)
-KNOWN_RULES = KNOWN_API_RULES | KNOWN_COMPONENT_RULES | KNOWN_NON_API_RULES
-
-ProgressCallback = Callable[[Path, int, int, int], None]
 
 
-def is_contract_attribute(name: str) -> bool:
+@dataclass(frozen=True)
+class ProgressUpdate:
+    """Byte-accurate progress for the integrator and corpus scans."""
+
+    path: Path
+    scanned_bytes: int
+    file_size: int
+    file_index: int
+    file_count: int
+    completed_bytes: int
+    total_bytes: int
+    stage: str
+
+
+ProgressCallback = Callable[[ProgressUpdate], None]
+
+
+class InputChangedDuringScan(OSError):
+    """An IFP changed after its cache identity was recorded."""
+
+
+def _ensure_unchanged(path: Path, before: stat_result) -> None:
+    after = path.stat()
+    if (
+        after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise InputChangedDuringScan(
+            f"IFP changed while it was being scanned: {path}; rerun after writes stop"
+        )
+
+
+def is_contract_attribute(
+    name: str, rule_config: RuleConfig = DEFAULT_RULE_CONFIG
+) -> bool:
     lowered = name.casefold()
     if lowered in DIRECT_ATTRIBUTE_NAMES:
+        return True
+    if any(
+        lowered == alias.casefold()
+        for aliases in rule_config.aliases.values()
+        for alias in aliases
+    ):
         return True
     if any(lowered.endswith(suffix.casefold()) for suffix in MAPPING_SUFFIXES):
         return True
@@ -86,7 +114,7 @@ def _rule_suffix(rule_class: str | None) -> str:
     return (rule_class or "").rsplit(".", 1)[-1]
 
 
-def _is_rule(span: TagSpan) -> bool:
+def _is_rule(span: XMLTagSpan) -> bool:
     return span.name.rsplit(":", 1)[-1].casefold() == "rule"
 
 
@@ -94,23 +122,24 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().casefold() in {"1", "true", "yes", "y", "on"}
 
 
-def _source_name(attributes: dict[str, str]) -> str | None:
-    exact = _value(attributes, "IRISSource", "SourceName", "Source", "DataSourceName")
+def _source_name(
+    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG
+) -> str | None:
+    exact = _value(attributes, *rule_config.attribute_names("source"))
     return exact or _value_ending_with(attributes, "source")
 
 
-def _api_path(attributes: dict[str, str]) -> str | None:
-    exact = _value(
-        attributes, "ResourcePath", "OperationPath", "RelativePath", "IRISPath",
-        "Path", "URL", "Uri", "Endpoint",
-    )
+def _api_path(
+    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG
+) -> str | None:
+    exact = _value(attributes, *rule_config.attribute_names("path"))
     return exact or _value_ending_with(attributes, "path", "url", "uri")
 
 
-def _base_url(attributes: dict[str, str]) -> str | None:
-    exact = _value(
-        attributes, "ServiceRootUri", "EndPointURL", "BaseURL", "BaseUri", "Endpoint"
-    )
+def _base_url(
+    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG
+) -> str | None:
+    exact = _value(attributes, *rule_config.attribute_names("base_url"))
     return exact or _value_ending_with(attributes, "url", "uri")
 
 
@@ -122,16 +151,22 @@ def _value_ending_with(attributes: dict[str, str], *suffixes: str) -> str | None
     return None
 
 
-def _api_classification(attributes: dict[str, str]) -> str | None:
+def _api_classification(
+    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG
+) -> str | None:
     rule_class = _rule_suffix(_value(attributes, "RuleClassName", "ClassType"))
-    if rule_class in KNOWN_API_RULES:
+    if rule_config.is_api_rule(rule_class):
         return "CONFIRMED"
-    method = _value(attributes, "HTTPMethod", "Action", "IRISAction") or _value_ending_with(
+    method = _value(attributes, *rule_config.attribute_names("method")) or _value_ending_with(
         attributes, "method"
     )
-    path = _api_path(attributes)
-    source = _source_name(attributes)
-    output = _value(attributes, "Output", "OutputDataGroup", "ResultsDataGroup")
+    path = _api_path(attributes, rule_config)
+    source = _source_name(attributes, rule_config)
+    output = _value(
+        attributes,
+        *rule_config.attribute_names("output"),
+        *rule_config.attribute_names("result"),
+    )
     if method and path:
         return "STRUCTURAL"
     if path and (source or output):
@@ -139,16 +174,52 @@ def _api_classification(attributes: dict[str, str]) -> str | None:
     return None
 
 
-def _matching_selector(attributes: dict[str, str], reference: str) -> str | None:
-    reference_folded = reference.casefold()
+def _normalized_reference(value: str, *, ignore_case: bool) -> str:
+    normalized = value.replace("\\", "/")
+    return normalized.casefold() if ignore_case else normalized
+
+
+def _reference_variants(references: Sequence[str]) -> tuple[str, ...]:
+    variants: list[str] = []
+    for reference in references:
+        if not reference:
+            continue
+        for variant in (reference, reference.replace("\\", "/"), reference.replace("/", "\\")):
+            if variant and variant not in variants:
+                variants.append(variant)
+    return tuple(variants)
+
+
+def _matching_selector(
+    attributes: dict[str, str],
+    references: Sequence[str],
+    *,
+    ignore_case: bool,
+    rule_config: RuleConfig = DEFAULT_RULE_CONFIG,
+) -> str | None:
+    normalized_references = tuple(
+        _normalized_reference(reference, ignore_case=ignore_case) for reference in references
+    )
+    selector_names = {
+        item.casefold() for item in rule_config.attribute_names("selector")
+    }
     for name, value in attributes.items():
-        if name.casefold() in REFERENCE_ATTRIBUTE_NAMES and reference_folded in value.casefold():
+        normalized_value = _normalized_reference(value, ignore_case=ignore_case)
+        if name.casefold() in selector_names and any(
+            reference in normalized_value for reference in normalized_references
+        ):
             return value
     return None
 
 
-def _is_component_call(attributes: dict[str, str]) -> bool:
-    return _rule_suffix(_value(attributes, "RuleClassName", "ClassType")) in KNOWN_COMPONENT_RULES
+def _is_component_call(
+    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG
+) -> bool:
+    return (
+        rule_config.is_component_rule(
+            _rule_suffix(_value(attributes, "RuleClassName", "ClassType"))
+        )
+    )
 
 
 def _diagnostic(
@@ -170,6 +241,40 @@ def _diagnostic(
         "message": message,
         "evidence": evidence or {},
     }
+
+
+def _attribute_diagnostics(
+    read: AttributeRead,
+    path: Path,
+    span: XMLTagSpan,
+    rule_class: str | None = None,
+) -> list[dict[str, object]]:
+    diagnostics: list[dict[str, object]] = []
+    for item in read.truncated:
+        diagnostics.append(
+            _diagnostic(
+                "WARNING",
+                "ATTRIBUTE_VALUE_TRUNCATED",
+                "Selected attribute exceeded the one-MiB capture limit; source offset is preserved.",
+                path=path,
+                offset=span.start,
+                rule_class=rule_class,
+                evidence={"attribute": item.name, "observed_bytes": item.observed_bytes},
+            )
+        )
+    for name in sorted(set(read.duplicates)):
+        diagnostics.append(
+            _diagnostic(
+                "WARNING",
+                "DUPLICATE_XML_ATTRIBUTE",
+                "Duplicate XML attribute encountered; the last value was retained.",
+                path=path,
+                offset=span.start,
+                rule_class=rule_class,
+                evidence={"attribute": name},
+            )
+        )
+    return diagnostics
 
 
 def mappings_from_attributes(attributes: dict[str, str]) -> list[dict[str, object]]:
@@ -223,29 +328,101 @@ def mappings_from_attributes(attributes: dict[str, str]) -> list[dict[str, objec
 class IntegratorScan:
     operations: list[dict[str, object]] = field(default_factory=list)
     data_sources: list[dict[str, object]] = field(default_factory=list)
+    integrator_mappings: list[dict[str, object]] = field(default_factory=list)
     rule_classes: Counter[str] = field(default_factory=Counter)
     diagnostics: list[dict[str, object]] = field(default_factory=list)
 
 
-def scan_integrator(path: str | Path) -> IntegratorScan:
+def scan_integrator(
+    path: str | Path,
+    rule_config: RuleConfig = DEFAULT_RULE_CONFIG,
+    *,
+    on_bytes: Callable[[int], None] | None = None,
+) -> IntegratorScan:
     """Scan only Rule and DataSource start tags in the designated DI file."""
 
     file_path = Path(path)
-    ensure_supported_encoding(file_path)
+    encoding = detect_xml_encoding(file_path)
     scan = IntegratorScan()
     source_urls: dict[str, str] = {}
+    api_shaped_unknown_classes: set[str] = set()
+    product_stack: list[dict[str, str | None]] = []
+    phase_stack: list[dict[str, str | None]] = []
     with file_path.open("rb") as random_handle:
-        spans = iter_target_start_tags(
-            file_path, (b"DataSource", b"Rule"), handle=random_handle
+        matches = iter_xml_visible_matches(
+            file_path,
+            ("<DataSource", "<Product", "</Product", "<Phase", "</Phase", "<Rule"),
+            encoding=encoding,
+            on_bytes=on_bytes,
         )
-        for span in spans:
-            attributes = read_selected_attributes(
-                file_path, span.start, span.end, is_contract_attribute, handle=random_handle
+        for match in matches:
+            span = find_tag_span(
+                file_path,
+                match.offset,
+                encoding=encoding,
+                handle=random_handle,
+                containing=False,
             )
+            expected_name = match.pattern.removeprefix("</").removeprefix("<")
+            if span is None or span.name != expected_name:
+                continue
+            if span.is_end:
+                stack = product_stack if span.name == "Product" else phase_stack
+                if stack:
+                    stack.pop()
+                else:
+                    scan.diagnostics.append(
+                        _diagnostic(
+                            "WARNING",
+                            "UNBALANCED_XML_STRUCTURE",
+                            f"Closing </{span.name}> has no tracked opening tag.",
+                            path=file_path,
+                            offset=span.start,
+                        )
+                    )
+                continue
+            read = read_tag_attributes(
+                file_path,
+                span,
+                lambda name: is_contract_attribute(name, rule_config),
+                encoding=encoding,
+                handle=random_handle,
+            )
+            attributes = read.values
+            scan.diagnostics.extend(_attribute_diagnostics(read, file_path, span))
+            if span.name == "Product":
+                product = {
+                    "name": _value(attributes, "Name"),
+                    "eid": _value(attributes, "eid"),
+                }
+                for mapping in mappings_from_attributes(attributes):
+                    scan.integrator_mappings.append(
+                        {
+                            "integrator_file": str(file_path),
+                            "product_name": product["name"],
+                            "product_eid": product["eid"],
+                            "tag_offset": span.start,
+                            "mapping_prefix": mapping["mapping_prefix"],
+                            "exported_property": mapping["solution_data_item"],
+                            "property_key": mapping["property_key"],
+                            "direction": mapping["direction"],
+                            "class_type": mapping["class_type"],
+                            "attributes": mapping["attributes"],
+                        }
+                    )
+                if not span.self_closing:
+                    product_stack.append(product)
+                continue
+            if span.name == "Phase":
+                if not span.self_closing:
+                    phase_stack.append(
+                        {"name": _value(attributes, "Name"), "eid": _value(attributes, "eid")}
+                    )
+                continue
             if span.name == "DataSource":
                 name = _value(attributes, "Name", "SourceName", "DataSourceName")
                 class_type = _value(attributes, "ClassType")
-                base_url = _base_url(attributes)
+                base_url = _base_url(attributes, rule_config)
                 marker = f"{class_type or ''} {base_url or ''}".casefold()
                 if base_url or any(word in marker for word in ("odata", "swagger", "rest", "http")):
                     row = {
@@ -260,39 +437,48 @@ def scan_integrator(path: str | Path) -> IntegratorScan:
 
             rule_class = _value(attributes, "RuleClassName", "ClassType") or "<missing>"
             scan.rule_classes[rule_class] += 1
-            classification = _api_classification(attributes)
+            classification = _api_classification(attributes, rule_config)
             if classification is None:
                 continue
-            source_name = _source_name(attributes)
+            source_name = _source_name(attributes, rule_config)
+            product = product_stack[-1] if product_stack else {}
+            phase = phase_stack[-1] if phase_stack else {}
             scan.operations.append(
                 {
                     "integrator_file": str(file_path), "tag_offset": span.start,
                     "rule_eid": _value(attributes, "eid"),
                     "rule_name": _value(attributes, "Name"), "rule_class": rule_class,
+                    "product_name": product.get("name"),
+                    "product_eid": product.get("eid"),
+                    "phase_name": phase.get("name"),
                     "classification": classification,
                     "rule_type": _value(attributes, "RuleType"),
                     "disabled": int(_truthy(_value(attributes, "RuleDisabled"))),
                     "source_name": source_name,
                     "base_url": source_urls.get((source_name or "").casefold()),
-                    "action": _value(attributes, "IRISAction", "Action", "HTTPMethod")
+                    "action": _value(attributes, *rule_config.attribute_names("method"))
                     or _value_ending_with(attributes, "method"),
-                    "api_path": _api_path(attributes),
+                    "api_path": _api_path(attributes, rule_config),
                     "filter_expr": _value(
-                        attributes, "Filter", "IRISFilter", "FilterDataItem", "Query"
+                        attributes, *rule_config.attribute_names("filter")
                     ),
                     "request_group": _value(
-                        attributes, "QueryInputDataGroup", "RequestDataGroup",
-                        "InputDataGroup", "Input",
+                        attributes, *rule_config.attribute_names("request")
                     ),
-                    "target_group": _value(attributes, "TargetDataGroup"),
+                    "target_group": _value(
+                        attributes, *rule_config.attribute_names("target")
+                    ),
                     "results_group": _value(
-                        attributes, "ResultsDataGroup", "ResultDataGroup"
+                        attributes, *rule_config.attribute_names("result")
                     ),
-                    "output_group": _value(attributes, "OutputDataGroup", "Output"),
+                    "output_group": _value(
+                        attributes, *rule_config.attribute_names("output")
+                    ),
                     "attributes": attributes,
                 }
             )
             if classification != "CONFIRMED":
+                api_shaped_unknown_classes.add(rule_class)
                 scan.diagnostics.append(
                     _diagnostic(
                         "WARNING", "UNKNOWN_API_RULE_CLASS",
@@ -300,9 +486,11 @@ def scan_integrator(path: str | Path) -> IntegratorScan:
                         path=file_path, offset=span.start, rule_class=rule_class,
                         evidence={
                             "classification": classification,
-                            "method": _value(attributes, "HTTPMethod", "Action", "IRISAction")
+                            "method": _value(
+                                attributes, *rule_config.attribute_names("method")
+                            )
                             or _value_ending_with(attributes, "method"),
-                            "path": _api_path(attributes),
+                            "path": _api_path(attributes, rule_config),
                         },
                     )
                 )
@@ -316,8 +504,11 @@ def scan_integrator(path: str | Path) -> IntegratorScan:
             )
 
     for rule_class, count in scan.rule_classes.items():
-        suffix = _rule_suffix(rule_class)
-        if rule_class != "<missing>" and suffix not in KNOWN_RULES:
+        if (
+            rule_class != "<missing>"
+            and rule_class not in api_shaped_unknown_classes
+            and not rule_config.is_known_rule(rule_class)
+        ):
             scan.diagnostics.append(
                 _diagnostic(
                     "NOTICE", "UNKNOWN_RULE_CLASS",
@@ -325,6 +516,20 @@ def scan_integrator(path: str | Path) -> IntegratorScan:
                     path=file_path, rule_class=rule_class, evidence={"count": count},
                 )
             )
+    if product_stack or phase_stack:
+        scan.diagnostics.append(
+            _diagnostic(
+                "WARNING",
+                "UNCLOSED_XML_STRUCTURE",
+                "The Data Integrator ended with an unclosed Product or Phase tag; "
+                "captured operation ownership may be incomplete.",
+                path=file_path,
+                evidence={
+                    "open_products": len(product_stack),
+                    "open_phases": len(phase_stack),
+                },
+            )
+        )
     return scan
 
 
@@ -332,59 +537,133 @@ def scan_integrator(path: str | Path) -> IntegratorScan:
 class ReferenceEvidence:
     caller: dict[str, object] | None = None
     mappings: list[dict[str, object]] = field(default_factory=list)
-    diagnostic: dict[str, object] | None = None
+    diagnostics: list[dict[str, object]] = field(default_factory=list)
+    direct_reference: bool = True
 
 
 def iter_caller_references(
     path: str | Path,
-    reference: str,
+    references: Sequence[str],
     *,
     file_index: int = 0,
+    file_count: int = 0,
+    completed_bytes: int = 0,
+    total_bytes: int = 0,
     progress: ProgressCallback | None = None,
+    ignore_case: bool = False,
+    include_dynamic: bool = False,
+    rule_config: RuleConfig = DEFAULT_RULE_CONFIG,
 ) -> Iterator[ReferenceEvidence]:
     """Yield every start-tag reference hit, including unclassified evidence."""
 
     file_path = Path(path)
-    ensure_supported_encoding(file_path)
-    needle = reference.encode("utf-8")
+    encoding = detect_xml_encoding(file_path)
+    reference_variants = _reference_variants(references)
+    dynamic_patterns = (
+        tuple(
+            pattern
+            for name in rule_config.attribute_names("selector")
+            for pattern in (f'{name}=\"$$', f"{name}='$$")
+        )
+        if include_dynamic
+        else ()
+    )
+    search_patterns = reference_variants + dynamic_patterns
     file_size = file_path.stat().st_size
     seen_tag_offsets: set[int] = set()
 
     def on_bytes(scanned: int) -> None:
         if progress is not None:
-            progress(file_path, scanned, file_size, file_index)
+            progress(
+                ProgressUpdate(
+                    path=file_path,
+                    scanned_bytes=scanned,
+                    file_size=file_size,
+                    file_index=file_index,
+                    file_count=file_count,
+                    completed_bytes=completed_bytes,
+                    total_bytes=total_bytes,
+                    stage="caller",
+                )
+            )
 
     with file_path.open("rb") as random_handle:
-        for occurrence in iter_occurrence_offsets(file_path, needle, on_bytes=on_bytes):
-            span = tag_span_containing(file_path, occurrence, handle=random_handle)
+        matches = iter_xml_visible_matches(
+            file_path,
+            search_patterns,
+            encoding=encoding,
+            ignore_case=ignore_case,
+            on_bytes=on_bytes,
+        )
+        for match in matches:
+            occurrence = match.offset
+            matched_reference = match.pattern
+            is_dynamic = matched_reference in dynamic_patterns
+            span = find_tag_span(
+                file_path, occurrence, encoding=encoding, handle=random_handle
+            )
             if span is None:
                 yield ReferenceEvidence(
-                    diagnostic=_diagnostic(
-                        "WARNING", "MALFORMED_REFERENCE_CONTEXT",
-                        "Reference bytes were found but no containing XML start tag could be read.",
-                        path=file_path, offset=occurrence,
-                    )
+                    diagnostics=[
+                        _diagnostic(
+                            "WARNING", "MALFORMED_REFERENCE_CONTEXT",
+                            "Reference bytes were found but no containing XML start tag could be read.",
+                            path=file_path, offset=occurrence,
+                        )
+                    ]
                 )
                 continue
-            if occurrence + len(needle) > span.end or span.start in seen_tag_offsets:
+            encoded_reference = encoding.encode(matched_reference)
+            if occurrence + len(encoded_reference) > span.end or span.start in seen_tag_offsets:
                 continue
             seen_tag_offsets.add(span.start)
             if not _is_rule(span):
                 yield ReferenceEvidence(
-                    diagnostic=_diagnostic(
-                        "NOTICE", "REFERENCE_ON_NON_RULE_TAG",
-                        f"Direct reference was found on <{span.name}> rather than <Rule>.",
-                        path=file_path, offset=span.start,
-                        evidence={"tag": span.name, "reference": reference},
-                    )
+                    diagnostics=[
+                        _diagnostic(
+                            "NOTICE", "REFERENCE_ON_NON_RULE_TAG",
+                            f"Direct reference was found on <{span.name}> rather than <Rule>.",
+                            path=file_path, offset=span.start,
+                            evidence={"tag": span.name, "reference": matched_reference},
+                        )
+                    ],
+                    direct_reference=not is_dynamic,
                 )
                 continue
 
-            attributes = read_selected_attributes(
-                file_path, span.start, span.end, is_contract_attribute, handle=random_handle
+            read = read_tag_attributes(
+                file_path,
+                span,
+                lambda name: is_contract_attribute(name, rule_config),
+                encoding=encoding,
+                handle=random_handle,
+                force_capture_offsets=(occurrence,),
             )
-            selector = _matching_selector(attributes, reference)
-            known_component_rule = _is_component_call(attributes)
+            attributes = read.values
+            if is_dynamic:
+                selector = _value(attributes, *rule_config.attribute_names("selector"))
+                yield ReferenceEvidence(
+                    diagnostics=[
+                        _diagnostic(
+                            "NOTICE",
+                            "DYNAMIC_REFERENCE_UNRESOLVED",
+                            "Dynamic SelectComponent cannot be proven to target this Data Integrator.",
+                            path=file_path,
+                            offset=span.start,
+                            rule_class=_value(attributes, "RuleClassName", "ClassType"),
+                            evidence={"selector": selector or matched_reference},
+                        )
+                    ] + _attribute_diagnostics(read, file_path, span),
+                    direct_reference=False,
+                )
+                continue
+            selector = _matching_selector(
+                attributes,
+                reference_variants,
+                ignore_case=ignore_case,
+                rule_config=rule_config,
+            )
+            known_component_rule = _is_component_call(attributes, rule_config)
             rule_class = _value(attributes, "RuleClassName", "ClassType")
             if selector and known_component_rule:
                 classification, diagnostic = "CONFIRMED", None
@@ -402,21 +681,22 @@ def iter_caller_references(
                     "WARNING", "UNKNOWN_REFERENCE_ATTRIBUTE",
                     "A component-call Rule contains the reference in an unrecognized attribute.",
                     path=file_path, offset=span.start, rule_class=rule_class,
-                    evidence={"reference": reference},
+                    evidence={"reference": matched_reference},
                 )
             else:
                 classification = "UNCLASSIFIED_REFERENCE"
                 matching_attributes = {
                     name: value
                     for name, value in attributes.items()
-                    if reference.casefold() in value.casefold()
+                    if _normalized_reference(matched_reference, ignore_case=ignore_case)
+                    in _normalized_reference(value, ignore_case=ignore_case)
                 }
                 diagnostic = _diagnostic(
                     "WARNING", "UNCLASSIFIED_REFERENCE_RULE",
                     "A Rule start tag contains the reference, but neither its class nor selector is recognized.",
                     path=file_path, offset=span.start, rule_class=rule_class,
                     evidence={
-                        "reference": reference,
+                        "reference": matched_reference,
                         "matching_attributes": matching_attributes,
                     },
                 )
@@ -427,14 +707,17 @@ def iter_caller_references(
                 "classification": classification,
                 "rule_type": _value(attributes, "RuleType"),
                 "disabled": int(_truthy(_value(attributes, "RuleDisabled"))),
-                "selector": selector or reference,
+                "selector": selector or matched_reference,
                 "source_name": _value(attributes, "Source", "SourceName"),
                 "component_list": _value(attributes, "ComponentList"),
                 "attributes": attributes,
             }
             yield ReferenceEvidence(
                 caller=caller, mappings=mappings_from_attributes(attributes),
-                diagnostic=diagnostic,
+                diagnostics=(
+                    ([diagnostic] if diagnostic is not None else [])
+                    + _attribute_diagnostics(read, file_path, span, rule_class)
+                ),
             )
 
 
@@ -443,11 +726,16 @@ class BuildSummary:
     integrator_file: str
     reference: str
     files_examined: int = 0
+    files_scanned: int = 0
+    files_skipped: int = 0
+    files_failed: int = 0
     referencing_files: int = 0
     data_sources: int = 0
+    integrator_mappings: int = 0
     odata_operations: int = 0
     caller_references: int = 0
     caller_mappings: int = 0
+    operation_links: int = 0
     diagnostics: int = 0
     warnings: list[str] = field(default_factory=list)
 
@@ -459,17 +747,112 @@ def iter_ifp_files(root: str | Path) -> Iterator[Path]:
             yield root_path
         return
     for path in root_path.rglob("*"):
-        if path.is_file() and path.suffix.casefold() == ".ifp":
+        if path.suffix.casefold() == ".ifp" and path.is_file():
             yield path
+
+
+def _normalized_operation_names(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    names: set[str] = set()
+    for item in re.split(r"[,;|]", value):
+        candidate = item.strip().replace("\\", "/").rstrip("/")
+        if not candidate:
+            continue
+        names.add(candidate.casefold())
+        names.add(candidate.rsplit("/", 1)[-1].casefold())
+    return names
+
+
+def _resolve_caller_operations(
+    caller: dict[str, object],
+    operations: list[tuple[int, dict[str, object]]],
+    path: Path,
+) -> tuple[list[tuple[int, str, dict[str, object]]], dict[str, object] | None]:
+    targets = _normalized_operation_names(str(caller.get("component_list") or ""))
+    targets.update(_normalized_operation_names(str(caller.get("source_name") or "")))
+    exact = [
+        (operation_id, operation)
+        for operation_id, operation in operations
+        if str(operation.get("product_name") or "").casefold() in targets
+    ]
+    if exact:
+        return (
+            [
+                (
+                    operation_id,
+                    "EXACT_PRODUCT",
+                    {"targets": sorted(targets), "product": operation.get("product_name")},
+                )
+                for operation_id, operation in exact
+            ],
+            None,
+        )
+
+    products = {
+        str(operation.get("product_name") or "").casefold()
+        for _, operation in operations
+        if operation.get("product_name")
+    }
+    if len(products) == 1 and operations:
+        return (
+            [
+                (
+                    operation_id,
+                    "SINGLE_PRODUCT_FALLBACK",
+                    {"targets": sorted(targets), "product": operation.get("product_name")},
+                )
+                for operation_id, operation in operations
+            ],
+            None,
+        )
+    if len(operations) == 1:
+        operation_id, operation = operations[0]
+        return (
+            [
+                (
+                    operation_id,
+                    "SINGLE_OPERATION_FALLBACK",
+                    {"targets": sorted(targets), "product": operation.get("product_name")},
+                )
+            ],
+            None,
+        )
+    code = "NO_API_OPERATION" if not operations else "AMBIGUOUS_OPERATION_TARGET"
+    message = (
+        "The Data Integrator contains no recognized API operation."
+        if not operations
+        else "Caller target could not be resolved to one Data Integrator Product."
+    )
+    return (
+        [],
+        _diagnostic(
+            "WARNING",
+            code,
+            message,
+            path=path,
+            offset=int(caller.get("tag_offset") or 0),
+            rule_class=str(caller.get("rule_class") or "") or None,
+            evidence={
+                "targets": sorted(targets),
+                "available_products": sorted(products),
+                "operation_count": len(operations),
+            },
+        ),
+    )
 
 
 def build_contracts(
     root: str | Path,
     integrator: str | Path,
-    reference: str,
+    reference: str | Sequence[str],
     store: ContractStore,
     *,
     progress: ProgressCallback | None = None,
+    ignore_case: bool = False,
+    include_dynamic: bool = False,
+    resume: bool = False,
+    rule_config: RuleConfig = DEFAULT_RULE_CONFIG,
 ) -> BuildSummary:
     """Build a contract-only SQLite database with bounded-memory scans."""
 
@@ -479,46 +862,194 @@ def build_contracts(
         raise FileNotFoundError(f"IFP corpus does not exist: {root_path}")
     if not integrator_path.is_file():
         raise FileNotFoundError(f"Data Integrator IFP does not exist: {integrator_path}")
-    if not reference:
+    references = (reference,) if isinstance(reference, str) else tuple(reference)
+    references = tuple(item for item in references if item)
+    if not references:
         raise ValueError("reference must not be empty")
 
-    summary = BuildSummary(integrator_file=str(integrator_path), reference=reference)
-    store.reset()
-    integrator_scan = scan_integrator(integrator_path)
+    summary = BuildSummary(
+        integrator_file=str(integrator_path), reference=", ".join(references)
+    )
+    integrator_stat = integrator_path.stat()
+    signature_payload = {
+        "format": 2,
+        "integrator": str(integrator_path.resolve()),
+        "integrator_size": integrator_stat.st_size,
+        "integrator_mtime_ns": integrator_stat.st_mtime_ns,
+        "references": references,
+        "ignore_case": ignore_case,
+        "include_dynamic": include_dynamic,
+        "rule_config": rule_config.signature_payload(),
+    }
+    reference_signature = hashlib.sha256(
+        json.dumps(signature_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    can_resume = resume and store.metadata_value("reference_signature") == reference_signature
+    if can_resume:
+        store.reset_integrator_results(str(integrator_path))
+    else:
+        store.reset()
+    integrator_resolved = integrator_path.resolve()
+    candidate_paths: list[Path] = []
+    candidate_stats: dict[Path, stat_result] = {}
+    stat_failures: list[tuple[Path, OSError]] = []
+    # The selected integrator counts even when it lives outside ``root``.
+    duplicate_integrator_names = 1
+    for candidate in iter_ifp_files(root_path):
+        if candidate.resolve() == integrator_resolved:
+            continue
+        if candidate.name.casefold() == integrator_path.name.casefold():
+            duplicate_integrator_names += 1
+        candidate_paths.append(candidate)
+        try:
+            candidate_stats[candidate] = candidate.stat()
+        except OSError as error:
+            stat_failures.append((candidate, error))
+
+    summary.files_examined = len(candidate_paths)
+    total_files = len(candidate_paths) + 1
+    total_bytes = integrator_stat.st_size + sum(
+        item.st_size for item in candidate_stats.values()
+    )
+
+    def integrator_progress(scanned: int) -> None:
+        if progress is not None:
+            progress(
+                ProgressUpdate(
+                    path=integrator_path,
+                    scanned_bytes=scanned,
+                    file_size=integrator_stat.st_size,
+                    file_index=1,
+                    file_count=total_files,
+                    completed_bytes=0,
+                    total_bytes=total_bytes,
+                    stage="integrator",
+                )
+            )
+
+    integrator_scan = scan_integrator(
+        integrator_path, rule_config, on_bytes=integrator_progress
+    )
+    _ensure_unchanged(integrator_path, integrator_stat)
     for data_source in integrator_scan.data_sources:
         store.add_data_source(data_source)
         summary.data_sources += 1
+    for mapping in integrator_scan.integrator_mappings:
+        store.add_integrator_mapping(mapping)
+        summary.integrator_mappings += 1
+    operation_records: list[tuple[int, dict[str, object]]] = []
     for operation in integrator_scan.operations:
-        store.add_operation(operation)
+        operation_id = store.add_operation(operation)
+        operation_records.append((operation_id, operation))
         summary.odata_operations += 1
     store.put_rule_class_census(str(integrator_path), dict(integrator_scan.rule_classes))
     for diagnostic in integrator_scan.diagnostics:
         store.add_diagnostic(diagnostic)
         summary.diagnostics += 1
+    store.put_metadata(
+        {
+            "schema_version": "4",
+            "database_kind": "ifp_contract_slicer",
+            "scan_status": "running",
+            "integrator_file": str(integrator_path),
+            "reference": ", ".join(references),
+            "reference_signature": reference_signature,
+            "ignore_case": str(int(ignore_case)),
+            "include_dynamic": str(int(include_dynamic)),
+            "rule_config": json.dumps(rule_config.signature_payload(), sort_keys=True),
+        }
+    )
+    store.commit()
 
-    integrator_resolved = integrator_path.resolve()
-    for candidate in iter_ifp_files(root_path):
-        if candidate.resolve() == integrator_resolved:
+    active_paths: set[str] = set()
+    basename_reference = any(
+        "/" not in item and "\\" not in item and item.casefold() == integrator_path.name.casefold()
+        for item in references
+    )
+    completed_bytes = integrator_stat.st_size
+    failed_by_path = {path: error for path, error in stat_failures}
+    for candidate_number, candidate in enumerate(candidate_paths, start=2):
+        candidate_text = str(candidate)
+        active_paths.add(candidate_text)
+        candidate_stat = candidate_stats.get(candidate)
+        if candidate_stat is None:
+            error = failed_by_path[candidate]
+            message = f"Could not stat {candidate}: {error}"
+            store.clear_file_results(candidate_text)
+            store.add_diagnostic(_diagnostic("ERROR", "FILE_STAT_FAILED", message, path=candidate))
+            summary.diagnostics += 1
+            summary.files_failed += 1
+            summary.warnings.append(message)
+            store.commit()
             continue
-        summary.files_examined += 1
+        if can_resume and store.file_is_cached(
+            candidate_text,
+            candidate_stat.st_size,
+            candidate_stat.st_mtime_ns,
+            reference_signature,
+        ):
+            summary.files_skipped += 1
+            if progress is not None:
+                progress(
+                    ProgressUpdate(
+                        path=candidate,
+                        scanned_bytes=candidate_stat.st_size,
+                        file_size=candidate_stat.st_size,
+                        file_index=candidate_number,
+                        file_count=total_files,
+                        completed_bytes=completed_bytes,
+                        total_bytes=total_bytes,
+                        stage="cached",
+                    )
+                )
+            completed_bytes += candidate_stat.st_size
+            continue
+        store.clear_file_results(candidate_text)
+        summary.files_scanned += 1
         saw_reference = False
+        file_callers = 0
+        file_diagnostics = 0
         try:
             for evidence in iter_caller_references(
-                candidate, reference, file_index=summary.files_examined, progress=progress
+                candidate,
+                references,
+                file_index=candidate_number,
+                file_count=total_files,
+                completed_bytes=completed_bytes,
+                total_bytes=total_bytes,
+                progress=progress,
+                ignore_case=ignore_case,
+                include_dynamic=include_dynamic,
+                rule_config=rule_config,
             ):
-                saw_reference = True
+                saw_reference = saw_reference or evidence.direct_reference
                 if evidence.caller is not None:
                     store.add_reference(evidence.caller, evidence.mappings)
                     summary.caller_references += 1
+                    file_callers += 1
                     summary.caller_mappings += len(evidence.mappings)
-                if evidence.diagnostic is not None:
-                    store.add_diagnostic(evidence.diagnostic)
+                for diagnostic in evidence.diagnostics:
+                    store.add_diagnostic(diagnostic)
                     summary.diagnostics += 1
+                    file_diagnostics += 1
+            _ensure_unchanged(candidate, candidate_stat)
             if saw_reference:
                 summary.referencing_files += 1
+            store.mark_file_scanned(
+                candidate_text,
+                candidate_stat.st_size,
+                candidate_stat.st_mtime_ns,
+                reference_signature,
+                "complete",
+                int(saw_reference),
+                file_callers,
+                file_diagnostics,
+            )
+            store.commit()
         except (
             OSError,
             UnicodeError,
+            MalformedXMLStructure,
             TagScanLimitExceeded,
             UnsupportedIFPEncoding,
         ) as error:
@@ -526,15 +1057,88 @@ def build_contracts(
             summary.warnings.append(message)
             store.add_diagnostic(_diagnostic("ERROR", "FILE_SCAN_FAILED", message, path=candidate))
             summary.diagnostics += 1
+            summary.files_failed += 1
+            store.mark_file_scanned(
+                candidate_text,
+                candidate_stat.st_size,
+                candidate_stat.st_mtime_ns,
+                reference_signature,
+                "failed",
+                int(saw_reference),
+                file_callers,
+                file_diagnostics + 1,
+            )
+            store.commit()
+        finally:
+            completed_bytes += candidate_stat.st_size
 
-    status = "complete_with_diagnostics" if summary.diagnostics else "complete"
+    if can_resume:
+        for stale_path in store.scanned_paths(reference_signature):
+            if stale_path not in active_paths:
+                store.clear_file_results(stale_path)
+
+    # Operations are refreshed every run, so rebuild these narrow links for
+    # both newly scanned and resume-skipped caller rows.
+    store.connection.execute("DELETE FROM caller_operation_links")
+    store.delete_diagnostics_by_codes(("AMBIGUOUS_OPERATION_TARGET", "NO_API_OPERATION"))
+    summary.operation_links = 0
+    for row in store.rows("SELECT * FROM caller_references ORDER BY id"):
+        caller = dict(row)
+        links, link_diagnostic = _resolve_caller_operations(
+            caller, operation_records, Path(str(caller["caller_file"]))
+        )
+        for operation_id, resolution_status, link_evidence in links:
+            store.add_operation_link(
+                int(caller["id"]), operation_id, resolution_status, link_evidence
+            )
+            summary.operation_links += 1
+        if link_diagnostic is not None:
+            store.add_diagnostic(link_diagnostic)
+
+    if basename_reference and duplicate_integrator_names > 1:
+        store.add_diagnostic(
+            _diagnostic(
+                "WARNING",
+                "AMBIGUOUS_INTEGRATOR_FILENAME",
+                "The corpus contains multiple IFP files with the selected Data Integrator filename.",
+                path=integrator_path,
+                evidence={
+                    "filename": integrator_path.name,
+                    "candidate_count": duplicate_integrator_names,
+                },
+            )
+        )
+        summary.diagnostics += 1
+
+    counts = store.counts()
+    summary.caller_references = counts["caller_references"]
+    summary.caller_mappings = counts["caller_mappings"]
+    summary.operation_links = store.operation_link_count()
+    summary.diagnostics = store.diagnostic_count()
+    summary.referencing_files = store.referencing_file_count(reference_signature)
+    status = (
+        "partial_with_errors"
+        if summary.files_failed
+        else "complete_with_diagnostics"
+        if summary.diagnostics
+        else "complete"
+    )
     store.put_metadata(
         {
-            "schema_version": "2", "scan_status": status,
-            "integrator_file": str(integrator_path), "reference": reference,
+            "schema_version": "4", "scan_status": status,
+            "database_kind": "ifp_contract_slicer",
+            "integrator_file": str(integrator_path), "reference": ", ".join(references),
+            "reference_signature": reference_signature,
+            "ignore_case": str(int(ignore_case)),
+            "include_dynamic": str(int(include_dynamic)),
+            "rule_config": json.dumps(rule_config.signature_payload(), sort_keys=True),
             "files_examined": str(summary.files_examined),
+            "files_scanned": str(summary.files_scanned),
+            "files_skipped": str(summary.files_skipped),
+            "files_failed": str(summary.files_failed),
             "referencing_files": str(summary.referencing_files),
         }
     )
     store.commit()
+    store.compact_if_wasteful()
     return summary
