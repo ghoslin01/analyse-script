@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project Name="Unrelated Screen" eid="SCREEN-UNRELATED">
+  <Rules>
+    <Rule Name="Local calculation" eid="LOCAL-1"
+      RuleClassName="com.acquire.intelligentforms.rules.SetValueRule"
+      FromValue="100" PropertyName="Screen[1].Total" />
+  </Rules>
+</Project>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project Name="Legacy Approval Screen" eid="SCREEN-LEGACY">
+  <Rules>
+    <Rule Name="Legacy submit" eid="CALL-LEGACY"
+      RuleClassName="vendor.rules.SpecialDispatchRule"
+      RuleType="PostPhase"
+      TargetModule="Integration/BankingDataIntegrator.ifp"
+      ComponentList="PlaceOrder" />
+  </Rules>
+</Project>

@@ -88,6 +88,26 @@ the database focused and small. Add `--include-dynamic-references` when you
 want a diagnostic census of them; these rows go to `diagnostics`, not to the
 confirmed caller list.
 
+### Run the complete example
+
+`examples/practical-corpus` contains a runnable banking-style Data Integrator,
+two normal screen callers, one unknown custom caller Rule, and one unrelated
+screen. It demonstrates the complete field-to-mapping-to-Product-to-API chain:
+
+```bash
+ifp-contract build examples/practical-corpus \
+  --integrator examples/practical-corpus/BankingDataIntegrator.ifp \
+  --db practical-contracts.db --fresh
+
+ifp-contract report --db practical-contracts.db \
+  --output practical-report.md
+```
+
+Expected totals are two API operations, two DataSources, three direct callers,
+four caller mappings, three exact Product-to-operation links, and one retained
+unknown-Rule diagnostic. `UnrelatedScreen.ifp` is read as bytes but creates no
+contract row.
+
 ## Storage contract
 
 SQLite stores only:

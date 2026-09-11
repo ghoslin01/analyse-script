@@ -600,3 +600,34 @@ def test_multiple_products_without_a_caller_target_are_reported_ambiguous(tmp_pa
         assert json.loads(row["evidence_json"])["available_products"] == ["a", "b"]
     finally:
         store.close()
+
+
+def test_practical_example_keeps_the_complete_contract_chain(tmp_path):
+    corpus = Path(__file__).parents[1] / "examples" / "practical-corpus"
+    integrator = corpus / "BankingDataIntegrator.ifp"
+    store = ContractStore(tmp_path / "contracts.db")
+    try:
+        summary = build_contracts(
+            corpus, integrator, "BankingDataIntegrator.ifp", store
+        )
+        assert (
+            summary.odata_operations,
+            summary.data_sources,
+            summary.caller_references,
+            summary.caller_mappings,
+            summary.operation_links,
+            summary.diagnostics,
+        ) == (2, 2, 3, 4, 3, 1)
+        requests = store.rows(
+            "SELECT action, base_url, api_path FROM odata_operations ORDER BY tag_offset"
+        )
+        assert [tuple(row) for row in requests] == [
+            ("GET", "https://api.bank.example/odata/v2", "customers"),
+            ("POST", "https://api.bank.example/v1", "/orders"),
+        ]
+        links = store.rows(
+            "SELECT resolution_status FROM caller_operation_links"
+        )
+        assert {row["resolution_status"] for row in links} == {"EXACT_PRODUCT"}
+    finally:
+        store.close()

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project Name="Customer Search Screen" eid="SCREEN-CUSTOMER">
+  <Rules>
+    <Rule Name="Load customer" eid="CALL-CUSTOMER"
+      RuleClassName="com.acquire.intelligentforms.rules.CallComponentRule"
+      RuleType="PostPhase"
+      SelectComponent="Integration/BankingDataIntegrator.ifp"
+      ComponentList="CustomerLookup"
+      CustomerId_ClassType="com.acquire.intelligentforms.entities.component.ComponentMapping"
+      CustomerId_SolutionDataItemMapping="Screen[1].Search[1].CustomerId"
+      CustomerId_PropertyKey="CustomerLookup[1].Request[1].CustomerId"
+      CustomerId_In="Y"
+      CustomerName_ClassType="com.acquire.intelligentforms.entities.component.ComponentMapping"
+      CustomerName_SolutionDataItemMapping="Screen[1].Customer[1].DisplayName"
+      CustomerName_PropertyKey="CustomerLookup[1].Response[1].CustomerName"
+      CustomerName_Out="Y" />
+  </Rules>
+</Project>

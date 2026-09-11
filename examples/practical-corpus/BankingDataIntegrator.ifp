@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project Name="Banking Data Integrator" eid="PROJECT-DI">
+  <DataSources>
+    <DataSource Name="Customer OData" eid="SOURCE-CUSTOMER"
+      ClassType="com.temenos.connect.integration.iris.rules.ODataSource"
+      ServiceRootUri="https://api.bank.example/odata/v2" />
+    <DataSource Name="Order REST" eid="SOURCE-ORDER"
+      ClassType="com.acquire.intelligentforms.entities.swagger.SwaggerDataSource"
+      EndPointURL="https://api.bank.example/v1" />
+  </DataSources>
+  <Products>
+    <Product Name="CustomerLookup" eid="PRODUCT-CUSTOMER"
+      CustomerName_ClassType="com.acquire.intelligentforms.entities.component.ComponentMapping"
+      CustomerName_ExportedProperty="CustomerLookup[1].Response[1].CustomerName"
+      CustomerName_PropertyKey="Response.CustomerName" CustomerName_PubOut="Y"
+      AccountStatus_ClassType="com.acquire.intelligentforms.entities.component.ComponentMapping"
+      AccountStatus_ExportedProperty="CustomerLookup[1].Response[1].AccountStatus"
+      AccountStatus_PropertyKey="Response.AccountStatus" AccountStatus_PubOut="Y">
+      <Phase Name="Lookup" eid="PHASE-CUSTOMER">
+        <Rule Name="Fetch customer by ID" eid="RULE-CUSTOMER-GET"
+          RuleClassName="com.temenos.connect.integration.iris.rules.InvokeIRISRule"
+          RuleType="PostPhase" IRISSource="Customer OData" IRISAction="GET"
+          ResourcePath="customers"
+          Filter="customerId eq $$CustomerLookup[1].Request[1].CustomerId$"
+          QueryInputDataGroup="CustomerLookup[1].Request[1]"
+          ResultsDataGroup="CustomerLookup[1].Response[1]"
+          OutputDataGroup="CustomerLookup[1].Response[1]" />
+      </Phase>
+    </Product>
+    <Product Name="PlaceOrder" eid="PRODUCT-ORDER"
+      OrderStatus_ClassType="com.acquire.intelligentforms.entities.component.ComponentMapping"
+      OrderStatus_ExportedProperty="PlaceOrder[1].Response[1].Status"
+      OrderStatus_PropertyKey="Response.Status" OrderStatus_PubOut="Y"
+      ConfirmationId_ClassType="com.acquire.intelligentforms.entities.component.ComponentMapping"
+      ConfirmationId_ExportedProperty="PlaceOrder[1].Response[1].ConfirmationId"
+      ConfirmationId_PropertyKey="Response.ConfirmationId" ConfirmationId_PubOut="Y">
+      <Phase Name="Submit" eid="PHASE-ORDER">
+        <Rule Name="Submit payment order" eid="RULE-ORDER-POST"
+          RuleClassName="com.acquire.intelligentforms.rules.SwaggerIntegrationRule"
+          RuleType="PostPhase" SourceName="Order REST" HTTPMethod="POST"
+          ResourcePath="/orders"
+          QueryInputDataGroup="PlaceOrder[1].Request[1]"
+          Output="PlaceOrder[1].Response[1]" />
+      </Phase>
+    </Product>
+  </Products>
+</Project>
