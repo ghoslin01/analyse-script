@@ -277,6 +277,14 @@ def _attribute_diagnostics(
     return diagnostics
 
 
+def _incompatible_rule(path: Path, offset: int, error: ValueError) -> dict[str, object]:
+    return _diagnostic(
+        "WARNING", "INCOMPATIBLE_RULE", "Rule could not be decoded; scanning continued.",
+        path=path, offset=offset,
+        evidence={"error_type": type(error).__name__, "reason": str(error)},
+    )
+
+
 def mappings_from_attributes(attributes: dict[str, str]) -> list[dict[str, object]]:
     """Turn flattened ``*_ComponentMapping`` attributes into compact rows."""
 
@@ -331,6 +339,23 @@ class IntegratorScan:
     integrator_mappings: list[dict[str, object]] = field(default_factory=list)
     rule_classes: Counter[str] = field(default_factory=Counter)
     diagnostics: list[dict[str, object]] = field(default_factory=list)
+    store: ContractStore | None = field(default=None, repr=False)
+
+    def add(self, kind: str, row: dict[str, object]) -> None:
+        if self.store is None:
+            getattr(self, kind).append(row)
+        else:
+            writers = {
+                "operations": self.store.add_operation,
+                "data_sources": self.store.add_data_source,
+                "integrator_mappings": self.store.add_integrator_mapping,
+                "diagnostics": self.store.add_diagnostic,
+            }
+            writers[kind](row)
+
+    def add_diagnostics(self, rows: list[dict[str, object]]) -> None:
+        for row in rows:
+            self.add("diagnostics", row)
 
 
 def scan_integrator(
@@ -338,12 +363,13 @@ def scan_integrator(
     rule_config: RuleConfig = DEFAULT_RULE_CONFIG,
     *,
     on_bytes: Callable[[int], None] | None = None,
+    store: ContractStore | None = None,
 ) -> IntegratorScan:
     """Scan only Rule and DataSource start tags in the designated DI file."""
 
     file_path = Path(path)
     encoding = detect_xml_encoding(file_path)
-    scan = IntegratorScan()
+    scan = IntegratorScan(store=store)
     source_urls: dict[str, str] = {}
     api_shaped_unknown_classes: set[str] = set()
     product_stack: list[dict[str, str | None]] = []
@@ -356,13 +382,19 @@ def scan_integrator(
             on_bytes=on_bytes,
         )
         for match in matches:
-            span = find_tag_span(
-                file_path,
-                match.offset,
-                encoding=encoding,
-                handle=random_handle,
-                containing=False,
-            )
+            try:
+                span = find_tag_span(
+                    file_path,
+                    match.offset,
+                    encoding=encoding,
+                    handle=random_handle,
+                    containing=False,
+                )
+            except (MalformedXMLStructure, TagScanLimitExceeded, UnicodeError) as error:
+                if match.pattern != "<Rule":
+                    raise
+                scan.add("diagnostics", _incompatible_rule(file_path, match.offset, error))
+                continue
             expected_name = match.pattern.removeprefix("</").removeprefix("<")
             if span is None or span.name != expected_name:
                 continue
@@ -371,7 +403,7 @@ def scan_integrator(
                 if stack:
                     stack.pop()
                 else:
-                    scan.diagnostics.append(
+                    scan.add("diagnostics",
                         _diagnostic(
                             "WARNING",
                             "UNBALANCED_XML_STRUCTURE",
@@ -381,22 +413,28 @@ def scan_integrator(
                         )
                     )
                 continue
-            read = read_tag_attributes(
-                file_path,
-                span,
-                lambda name: is_contract_attribute(name, rule_config),
-                encoding=encoding,
-                handle=random_handle,
-            )
+            try:
+                read = read_tag_attributes(
+                    file_path,
+                    span,
+                    lambda name: is_contract_attribute(name, rule_config),
+                    encoding=encoding,
+                    handle=random_handle,
+                )
+            except (MalformedXMLStructure, UnicodeError) as error:
+                if not _is_rule(span):
+                    raise
+                scan.add("diagnostics", _incompatible_rule(file_path, span.start, error))
+                continue
             attributes = read.values
-            scan.diagnostics.extend(_attribute_diagnostics(read, file_path, span))
+            scan.add_diagnostics(_attribute_diagnostics(read, file_path, span))
             if span.name == "Product":
                 product = {
                     "name": _value(attributes, "Name"),
                     "eid": _value(attributes, "eid"),
                 }
                 for mapping in mappings_from_attributes(attributes):
-                    scan.integrator_mappings.append(
+                    scan.add("integrator_mappings",
                         {
                             "integrator_file": str(file_path),
                             "product_name": product["name"],
@@ -430,8 +468,8 @@ def scan_integrator(
                         "source_name": name, "class_type": class_type, "base_url": base_url,
                         "attributes": attributes,
                     }
-                    scan.data_sources.append(row)
-                    if name and base_url:
+                    scan.add("data_sources", row)
+                    if store is None and name and base_url:
                         source_urls[name.casefold()] = base_url
                 continue
 
@@ -443,7 +481,7 @@ def scan_integrator(
             source_name = _source_name(attributes, rule_config)
             product = product_stack[-1] if product_stack else {}
             phase = phase_stack[-1] if phase_stack else {}
-            scan.operations.append(
+            scan.add("operations",
                 {
                     "integrator_file": str(file_path), "tag_offset": span.start,
                     "rule_eid": _value(attributes, "eid"),
@@ -479,7 +517,7 @@ def scan_integrator(
             )
             if classification != "CONFIRMED":
                 api_shaped_unknown_classes.add(rule_class)
-                scan.diagnostics.append(
+                scan.add("diagnostics",
                     _diagnostic(
                         "WARNING", "UNKNOWN_API_RULE_CLASS",
                         "API-shaped Rule has an unrecognized RuleClassName; preserved as evidence.",
@@ -509,7 +547,7 @@ def scan_integrator(
             and rule_class not in api_shaped_unknown_classes
             and not rule_config.is_known_rule(rule_class)
         ):
-            scan.diagnostics.append(
+            scan.add("diagnostics",
                 _diagnostic(
                     "NOTICE", "UNKNOWN_RULE_CLASS",
                     f"Unrecognized RuleClassName occurred {count} time(s) in the integrator.",
@@ -517,7 +555,7 @@ def scan_integrator(
                 )
             )
     if product_stack or phase_stack:
-        scan.diagnostics.append(
+        scan.add("diagnostics",
             _diagnostic(
                 "WARNING",
                 "UNCLOSED_XML_STRUCTURE",
@@ -559,18 +597,13 @@ def iter_caller_references(
     file_path = Path(path)
     encoding = detect_xml_encoding(file_path)
     reference_variants = _reference_variants(references)
-    dynamic_patterns = (
-        tuple(
-            pattern
-            for name in rule_config.attribute_names("selector")
-            for pattern in (f'{name}=\"$$', f"{name}='$$")
-        )
-        if include_dynamic
-        else ()
-    )
+    selector_names = {item.casefold() for item in rule_config.attribute_names("selector")}
+    # Match the expression marker independently of attribute whitespace.
+    # The attribute reader below verifies that it belongs to a selector.
+    dynamic_patterns = ("$$",) if include_dynamic else ()
     search_patterns = reference_variants + dynamic_patterns
     file_size = file_path.stat().st_size
-    seen_tag_offsets: set[int] = set()
+    last_tag_end = -1
 
     def on_bytes(scanned: int) -> None:
         if progress is not None:
@@ -597,11 +630,20 @@ def iter_caller_references(
         )
         for match in matches:
             occurrence = match.offset
+            if occurrence < last_tag_end:
+                continue
             matched_reference = match.pattern
             is_dynamic = matched_reference in dynamic_patterns
-            span = find_tag_span(
-                file_path, occurrence, encoding=encoding, handle=random_handle
-            )
+            try:
+                span = find_tag_span(
+                    file_path, occurrence, encoding=encoding, handle=random_handle
+                )
+            except (MalformedXMLStructure, TagScanLimitExceeded, UnicodeError) as error:
+                yield ReferenceEvidence(
+                    diagnostics=[_incompatible_rule(file_path, occurrence, error)],
+                    direct_reference=not is_dynamic,
+                )
+                continue
             if span is None:
                 yield ReferenceEvidence(
                     diagnostics=[
@@ -614,10 +656,12 @@ def iter_caller_references(
                 )
                 continue
             encoded_reference = encoding.encode(matched_reference)
-            if occurrence + len(encoded_reference) > span.end or span.start in seen_tag_offsets:
+            if occurrence + len(encoded_reference) > span.end:
                 continue
-            seen_tag_offsets.add(span.start)
             if not _is_rule(span):
+                if is_dynamic:
+                    continue
+                last_tag_end = span.end
                 yield ReferenceEvidence(
                     diagnostics=[
                         _diagnostic(
@@ -631,17 +675,36 @@ def iter_caller_references(
                 )
                 continue
 
-            read = read_tag_attributes(
-                file_path,
-                span,
-                lambda name: is_contract_attribute(name, rule_config),
-                encoding=encoding,
-                handle=random_handle,
-                force_capture_offsets=(occurrence,),
-            )
+            last_tag_end = span.end
+            try:
+                read = read_tag_attributes(
+                    file_path,
+                    span,
+                    lambda name: is_contract_attribute(name, rule_config),
+                    encoding=encoding,
+                    handle=random_handle,
+                    force_capture_offsets=(occurrence,),
+                    reference_patterns=reference_variants,
+                    ignore_case=ignore_case,
+                )
+            except (MalformedXMLStructure, UnicodeError) as error:
+                yield ReferenceEvidence(
+                    diagnostics=[_incompatible_rule(file_path, span.start, error)],
+                    direct_reference=not is_dynamic,
+                )
+                continue
             attributes = read.values
-            if is_dynamic:
-                selector = _value(attributes, *rule_config.attribute_names("selector"))
+            selector = _matching_selector(
+                attributes, reference_variants, ignore_case=ignore_case, rule_config=rule_config,
+            )
+            if is_dynamic and not selector and not read.matched_references:
+                selector = next(
+                    (value for name, value in attributes.items()
+                     if name.casefold() in selector_names and value.lstrip().startswith("$$")),
+                    None,
+                )
+                if selector is None:
+                    continue
                 yield ReferenceEvidence(
                     diagnostics=[
                         _diagnostic(
@@ -657,12 +720,14 @@ def iter_caller_references(
                     direct_reference=False,
                 )
                 continue
-            selector = _matching_selector(
-                attributes,
-                reference_variants,
-                ignore_case=ignore_case,
-                rule_config=rule_config,
-            )
+            if selector:
+                matched_reference = next(
+                    item for item in reference_variants
+                    if _normalized_reference(item, ignore_case=ignore_case)
+                    in _normalized_reference(selector, ignore_case=ignore_case)
+                )
+            elif read.matched_references:
+                matched_reference = next(item for item in reference_variants if item in read.matched_references)
             known_component_rule = _is_component_call(attributes, rule_config)
             rule_class = _value(attributes, "RuleClassName", "ClassType")
             if selector and known_component_rule:
@@ -764,80 +829,78 @@ def _normalized_operation_names(value: str | None) -> set[str]:
     return names
 
 
+class _OperationIndex:
+    """Disk-backed, narrow Product lookup; never retain all API rows in RAM."""
+
+    def __init__(self, store: ContractStore) -> None:
+        self.store = store
+        store.connection.execute("DROP TABLE IF EXISTS temp.operation_index")
+        store.connection.execute(
+            "CREATE TEMP TABLE operation_index AS SELECT id, product_name, "
+            "casefold(product_name) AS product_key FROM odata_operations"
+        )
+        store.connection.execute("CREATE INDEX temp.idx_product_key ON operation_index(product_key)")
+        self.operation_count = int(store.connection.execute("SELECT COUNT(*) FROM operation_index").fetchone()[0])
+        self.product_count = int(store.connection.execute(
+            "SELECT COUNT(DISTINCT product_key) FROM operation_index WHERE product_key != ''"
+        ).fetchone()[0])
+
+
 def _resolve_caller_operations(
     caller: dict[str, object],
-    operations: list[tuple[int, dict[str, object]]],
+    operations: _OperationIndex,
     path: Path,
-) -> tuple[list[tuple[int, str, dict[str, object]]], dict[str, object] | None]:
+) -> tuple[Iterator[tuple[int, str, dict[str, object]]], dict[str, object] | None]:
     targets = _normalized_operation_names(str(caller.get("component_list") or ""))
     targets.update(_normalized_operation_names(str(caller.get("source_name") or "")))
-    exact = [
-        (operation_id, operation)
-        for operation_id, operation in operations
-        if str(operation.get("product_name") or "").casefold() in targets
-    ]
-    if exact:
+    store = operations.store
+    # A temporary target table avoids SQLite's parameter-count limit for
+    # large exported ComponentList values.
+    store.connection.execute("CREATE TEMP TABLE IF NOT EXISTS caller_targets(name TEXT PRIMARY KEY)")
+    store.connection.execute("DELETE FROM caller_targets")
+    store.connection.executemany("INSERT INTO caller_targets VALUES (?)", ((name,) for name in targets))
+    exact_sql = "SELECT id, product_name FROM operation_index WHERE product_key IN (SELECT name FROM caller_targets)"
+    has_exact = store.connection.execute("SELECT EXISTS(" + exact_sql + ")").fetchone()[0]
+    status = None
+    query = "SELECT id, product_name FROM operation_index"
+    if has_exact:
+        status = "EXACT_PRODUCT"
+        query = exact_sql
+    elif not targets and operations.product_count == 1 and operations.operation_count:
+        status = "SINGLE_PRODUCT_FALLBACK"
+        query += " WHERE product_key != ''"
+    elif not targets and operations.operation_count == 1:
+        status = "SINGLE_OPERATION_FALLBACK"
+    if status:
+        evidence_targets = sorted(targets)
         return (
-            [
-                (
-                    operation_id,
-                    "EXACT_PRODUCT",
-                    {"targets": sorted(targets), "product": operation.get("product_name")},
-                )
-                for operation_id, operation in exact
-            ],
+            ((int(row["id"]), status, {"targets": evidence_targets, "product": row["product_name"]})
+             for row in store.iter_rows(query)),
             None,
         )
-
-    products = {
-        str(operation.get("product_name") or "").casefold()
-        for _, operation in operations
-        if operation.get("product_name")
-    }
-    if len(products) == 1 and operations:
-        return (
-            [
-                (
-                    operation_id,
-                    "SINGLE_PRODUCT_FALLBACK",
-                    {"targets": sorted(targets), "product": operation.get("product_name")},
-                )
-                for operation_id, operation in operations
-            ],
-            None,
-        )
-    if len(operations) == 1:
-        operation_id, operation = operations[0]
-        return (
-            [
-                (
-                    operation_id,
-                    "SINGLE_OPERATION_FALLBACK",
-                    {"targets": sorted(targets), "product": operation.get("product_name")},
-                )
-            ],
-            None,
-        )
-    code = "NO_API_OPERATION" if not operations else "AMBIGUOUS_OPERATION_TARGET"
+    products = [row[0] for row in store.iter_rows(
+        "SELECT DISTINCT product_key FROM operation_index WHERE product_key != '' ORDER BY product_key LIMIT 100"
+    )]
+    code = "NO_API_OPERATION" if not operations.operation_count else "AMBIGUOUS_OPERATION_TARGET"
     message = (
         "The Data Integrator contains no recognized API operation."
-        if not operations
+        if not operations.operation_count
         else "Caller target could not be resolved to one Data Integrator Product."
     )
+    evidence = {
+        "targets": sorted(targets), "available_products": products,
+        "operation_count": operations.operation_count,
+    }
+    if operations.product_count > len(products):
+        evidence["available_products_truncated"] = True
+        evidence["product_count"] = operations.product_count
     return (
-        [],
+        iter(()),
         _diagnostic(
-            "WARNING",
-            code,
-            message,
-            path=path,
+            "WARNING", code, message, path=path,
             offset=int(caller.get("tag_offset") or 0),
             rule_class=str(caller.get("rule_class") or "") or None,
-            evidence={
-                "targets": sorted(targets),
-                "available_products": sorted(products),
-                "operation_count": len(operations),
-            },
+            evidence=evidence,
         ),
     )
 
@@ -872,7 +935,8 @@ def build_contracts(
     )
     integrator_stat = integrator_path.stat()
     signature_payload = {
-        "format": 2,
+        # Invalidate callers extracted before rule recovery / selector fixes.
+        "format": 4,
         "integrator": str(integrator_path.resolve()),
         "integrator_size": integrator_stat.st_size,
         "integrator_mtime_ns": integrator_stat.st_mtime_ns,
@@ -887,12 +951,11 @@ def build_contracts(
     can_resume = resume and store.metadata_value("reference_signature") == reference_signature
     if can_resume:
         store.reset_integrator_results(str(integrator_path))
+        store.connection.execute("DELETE FROM scan_files WHERE file_path = ?", (str(integrator_path),))
     else:
         store.reset()
     integrator_resolved = integrator_path.resolve()
-    candidate_paths: list[Path] = []
-    candidate_stats: dict[Path, stat_result] = {}
-    stat_failures: list[tuple[Path, OSError]] = []
+    total_bytes = integrator_stat.st_size
     # The selected integrator counts even when it lives outside ``root``.
     duplicate_integrator_names = 1
     for candidate in iter_ifp_files(root_path):
@@ -900,17 +963,14 @@ def build_contracts(
             continue
         if candidate.name.casefold() == integrator_path.name.casefold():
             duplicate_integrator_names += 1
-        candidate_paths.append(candidate)
+        summary.files_examined += 1
         try:
-            candidate_stats[candidate] = candidate.stat()
-        except OSError as error:
-            stat_failures.append((candidate, error))
+            total_bytes += candidate.stat().st_size
+        except OSError:
+            # Retry and record the failure during the scan below.
+            pass
 
-    summary.files_examined = len(candidate_paths)
-    total_files = len(candidate_paths) + 1
-    total_bytes = integrator_stat.st_size + sum(
-        item.st_size for item in candidate_stats.values()
-    )
+    total_files = summary.files_examined + 1
 
     def integrator_progress(scanned: int) -> None:
         if progress is not None:
@@ -927,25 +987,34 @@ def build_contracts(
                 )
             )
 
-    integrator_scan = scan_integrator(
-        integrator_path, rule_config, on_bytes=integrator_progress
+    try:
+        integrator_scan = scan_integrator(
+            integrator_path, rule_config, on_bytes=integrator_progress, store=store,
+        )
+        _ensure_unchanged(integrator_path, integrator_stat)
+    except (OSError, UnicodeError, MalformedXMLStructure, TagScanLimitExceeded, UnsupportedIFPEncoding) as error:
+        # The caller corpus can still yield useful evidence if the selected
+        # integrator is unreadable. Publication remains blocked by files_failed.
+        integrator_scan = IntegratorScan()
+        summary.files_failed += 1
+        message = f"Could not inspect {integrator_path}: {error}"
+        summary.warnings.append(message)
+        store.add_diagnostic(_diagnostic("ERROR", "FILE_SCAN_FAILED", message, path=integrator_path))
+        store.mark_file_scanned(
+            str(integrator_path), integrator_stat.st_size, integrator_stat.st_mtime_ns,
+            reference_signature, "failed", 0, 0, 1,
+        )
+    store.connection.execute(
+        "UPDATE odata_operations SET base_url = ("
+        "SELECT base_url FROM data_sources WHERE casefold(data_sources.source_name) = "
+        "casefold(odata_operations.source_name) AND base_url IS NOT NULL "
+        "ORDER BY tag_offset DESC LIMIT 1) WHERE base_url IS NULL "
+        "AND source_name IS NOT NULL AND source_name != ''"
     )
-    _ensure_unchanged(integrator_path, integrator_stat)
-    for data_source in integrator_scan.data_sources:
-        store.add_data_source(data_source)
-        summary.data_sources += 1
-    for mapping in integrator_scan.integrator_mappings:
-        store.add_integrator_mapping(mapping)
-        summary.integrator_mappings += 1
-    operation_records: list[tuple[int, dict[str, object]]] = []
-    for operation in integrator_scan.operations:
-        operation_id = store.add_operation(operation)
-        operation_records.append((operation_id, operation))
-        summary.odata_operations += 1
+    summary.data_sources = int(store.connection.execute("SELECT COUNT(*) FROM data_sources").fetchone()[0])
+    summary.integrator_mappings = int(store.connection.execute("SELECT COUNT(*) FROM integrator_mappings").fetchone()[0])
+    summary.odata_operations = store.counts()["odata_operations"]
     store.put_rule_class_census(str(integrator_path), dict(integrator_scan.rule_classes))
-    for diagnostic in integrator_scan.diagnostics:
-        store.add_diagnostic(diagnostic)
-        summary.diagnostics += 1
     store.put_metadata(
         {
             "schema_version": "4",
@@ -956,30 +1025,46 @@ def build_contracts(
             "reference_signature": reference_signature,
             "ignore_case": str(int(ignore_case)),
             "include_dynamic": str(int(include_dynamic)),
+            "storage_policy": "reference_hits_only",
             "rule_config": json.dumps(rule_config.signature_payload(), sort_keys=True),
         }
     )
     store.commit()
 
-    active_paths: set[str] = set()
+    # Only previously stored evidence participates in stale-file cleanup.
+    # A TEMP table also covers diagnostic-only files without publishing an
+    # index of unrelated corpus files or keeping their paths in Python RAM.
+    store.connection.execute("DROP TABLE IF EXISTS temp.pending_cleanup")
+    store.connection.execute(
+        "CREATE TEMP TABLE pending_cleanup(file_path TEXT PRIMARY KEY)"
+    )
+    if can_resume:
+        store.connection.execute(
+            "INSERT OR IGNORE INTO pending_cleanup SELECT file_path FROM scan_files "
+            "UNION SELECT caller_file FROM caller_references "
+            "UNION SELECT file_path FROM diagnostics WHERE file_path IS NOT NULL AND file_path != ?",
+            (str(integrator_path),),
+        )
+        store.connection.execute("DELETE FROM pending_cleanup WHERE file_path = ?", (str(integrator_path),))
     basename_reference = any(
         "/" not in item and "\\" not in item and item.casefold() == integrator_path.name.casefold()
         for item in references
     )
     completed_bytes = integrator_stat.st_size
-    failed_by_path = {path: error for path, error in stat_failures}
-    for candidate_number, candidate in enumerate(candidate_paths, start=2):
+    candidates = (path for path in iter_ifp_files(root_path) if path.resolve() != integrator_resolved)
+    for candidate_number, candidate in enumerate(candidates, start=2):
         candidate_text = str(candidate)
-        active_paths.add(candidate_text)
-        candidate_stat = candidate_stats.get(candidate)
-        if candidate_stat is None:
-            error = failed_by_path[candidate]
+        store.connection.execute("DELETE FROM pending_cleanup WHERE file_path = ?", (candidate_text,))
+        try:
+            candidate_stat = candidate.stat()
+        except OSError as error:
             message = f"Could not stat {candidate}: {error}"
             store.clear_file_results(candidate_text)
             store.add_diagnostic(_diagnostic("ERROR", "FILE_STAT_FAILED", message, path=candidate))
             summary.diagnostics += 1
             summary.files_failed += 1
             summary.warnings.append(message)
+            store.mark_file_scanned(candidate_text, -1, -1, reference_signature, "failed", 0, 0, 1)
             store.commit()
             continue
         if can_resume and store.file_is_cached(
@@ -1035,16 +1120,22 @@ def build_contracts(
             _ensure_unchanged(candidate, candidate_stat)
             if saw_reference:
                 summary.referencing_files += 1
-            store.mark_file_scanned(
-                candidate_text,
-                candidate_stat.st_size,
-                candidate_stat.st_mtime_ns,
-                reference_signature,
-                "complete",
-                int(saw_reference),
-                file_callers,
-                file_diagnostics,
-            )
+            # A completed miss is deliberately not persisted. The corpus is
+            # streamed to discover references, but the published database is
+            # a focused contract slice rather than a whole-project file index.
+            # Matching files remain resumable; misses are cheaply rechecked on
+            # a later build.
+            if saw_reference:
+                store.mark_file_scanned(
+                    candidate_text,
+                    candidate_stat.st_size,
+                    candidate_stat.st_mtime_ns,
+                    reference_signature,
+                    "complete",
+                    1,
+                    file_callers,
+                    file_diagnostics,
+                )
             store.commit()
         except (
             OSError,
@@ -1072,17 +1163,17 @@ def build_contracts(
         finally:
             completed_bytes += candidate_stat.st_size
 
-    if can_resume:
-        for stale_path in store.scanned_paths(reference_signature):
-            if stale_path not in active_paths:
-                store.clear_file_results(stale_path)
+    for row in store.iter_rows("SELECT file_path FROM pending_cleanup"):
+        store.clear_file_results(str(row[0]))
+    store.connection.execute("DROP TABLE pending_cleanup")
 
     # Operations are refreshed every run, so rebuild these narrow links for
     # both newly scanned and resume-skipped caller rows.
     store.connection.execute("DELETE FROM caller_operation_links")
     store.delete_diagnostics_by_codes(("AMBIGUOUS_OPERATION_TARGET", "NO_API_OPERATION"))
     summary.operation_links = 0
-    for row in store.rows("SELECT * FROM caller_references ORDER BY id"):
+    operation_records = _OperationIndex(store)
+    for row in store.iter_rows("SELECT * FROM caller_references ORDER BY id"):
         caller = dict(row)
         links, link_diagnostic = _resolve_caller_operations(
             caller, operation_records, Path(str(caller["caller_file"]))
@@ -1131,6 +1222,7 @@ def build_contracts(
             "reference_signature": reference_signature,
             "ignore_case": str(int(ignore_case)),
             "include_dynamic": str(int(include_dynamic)),
+            "storage_policy": "reference_hits_only",
             "rule_config": json.dumps(rule_config.signature_payload(), sort_keys=True),
             "files_examined": str(summary.files_examined),
             "files_scanned": str(summary.files_scanned),

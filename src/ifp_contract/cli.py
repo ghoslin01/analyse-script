@@ -520,17 +520,24 @@ def main(argv: list[str] | None = None) -> int:
     if not args.db.is_file():
         print(f"ERROR: contract database does not exist: {args.db}", file=sys.stderr)
         return 1
-    store = ContractStore(args.db)
+    store = None
     try:
+        store = ContractStore(args.db, readonly=True)
         content = _markdown(store) if args.format == "markdown" else _report_json(store)
+        if args.output:
+            if args.output.resolve() == args.db.resolve():
+                raise ValueError("Report output must differ from the source database")
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(content, encoding="utf-8")
+            print(f"Wrote {args.format} report: {args.output}")
+        else:
+            print(content, end="")
+    except (OSError, ValueError, sqlite3.Error) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
     finally:
-        store.close()
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(content, encoding="utf-8")
-        print(f"Wrote {args.format} report: {args.output}")
-    else:
-        print(content, end="")
+        if store is not None:
+            store.close()
     return 0
 
 

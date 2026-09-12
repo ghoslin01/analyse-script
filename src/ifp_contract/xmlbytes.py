@@ -80,7 +80,7 @@ def detect_xml_encoding(path: str | Path) -> XMLByteEncoding:
     if normalized == "utf-16-be":
         return UTF16_BE
     probe = "<Rule>".encode(normalized)
-    if len(probe) == len("<Rule>"):
+    if probe == b"<Rule>":
         return XMLByteEncoding(normalized)
     raise UnsupportedIFPEncoding(
         f"Encoding {codec!r} uses variable-width/non-ASCII XML delimiters and is unsupported: {path}"
@@ -159,6 +159,18 @@ def iter_xml_visible_matches(
             safe_end -= (base + safe_end) % enc.unit
             view = searchable(data)
             cursor = 0
+            next_positions: dict[tuple[int, str], int] = {}
+
+            def next_position(raw: bytes, key: tuple[int, str]) -> int:
+                # Cache misses and future hits within this chunk. Dense Rule
+                # files must not re-search the entire remaining MiB for each
+                # absent marker on every match.
+                found = next_positions.get(key)
+                if found is None or 0 <= found < cursor:
+                    found = _aligned_find(view, raw, cursor, enc.unit, base)
+                    next_positions[key] = found
+                return found
+
             while cursor < safe_end:
                 if state == "comment":
                     found = _aligned_find(
@@ -215,21 +227,25 @@ def iter_xml_visible_matches(
 
                 events: list[tuple[int, int, str]] = []
                 for raw, label in target_search:
-                    found = _aligned_find(view, raw, cursor, enc.unit, base)
+                    found = next_position(raw, (1, label))
                     if 0 <= found < safe_end:
                         events.append((found, 1, label))
                 for marker, priority in (
                     ("comment_open", 0), ("cdata_open", 0),
                     ("pi_open", 0), ("declaration_open", 2),
                 ):
-                    found = _aligned_find(view, special_search[marker], cursor, enc.unit, base)
+                    found = next_position(special_search[marker], (priority, marker))
                     if 0 <= found < safe_end:
                         events.append((found, priority, marker))
                 if not events:
                     cursor = safe_end
                     continue
-                found, _, event = min(events)
-                if event == "comment_open":
+                found, priority, event = min(events)
+                if priority == 1:
+                    yield VisibleMatch(offset=base + found, pattern=event)
+                    raw = enc.encode(event)
+                    cursor = found + max(enc.unit, len(raw))
+                elif event == "comment_open":
                     state = "comment"
                     cursor = found + len(specials[event])
                 elif event == "cdata_open":
@@ -243,10 +259,6 @@ def iter_xml_visible_matches(
                     declaration_quote = None
                     declaration_brackets = 0
                     cursor = found + len(specials[event])
-                else:
-                    yield VisibleMatch(offset=base + found, pattern=event)
-                    raw = enc.encode(event)
-                    cursor = found + max(enc.unit, len(raw))
 
             carry = data[safe_end:]
             bytes_read += len(block)
@@ -338,7 +350,7 @@ def find_tag_span(
         name = bytearray()
         scanned = 0
         while scanned < max_tag_bytes:
-            read_size = min(chunk_size, max_tag_bytes - scanned)
+            read_size = min(chunk_size, 4096 if scanned == 0 else chunk_size, max_tag_bytes - scanned)
             read_size -= read_size % unit
             block = reader.read(read_size)
             if not block:
@@ -381,6 +393,11 @@ def find_tag_span(
                     index += unit
                 elif quote is not None:
                     found = _aligned_find(block, quote, index, unit, block_start)
+                    nested = _aligned_find(block, tokens["lt"], index, unit, block_start)
+                    if nested >= 0 and (found < 0 or nested < found):
+                        raise MalformedXMLStructure(
+                            f"Unexpected '<' in quoted attribute of tag at byte {tag_start}"
+                        )
                     if found < 0:
                         index = len(block)
                     else:
@@ -389,7 +406,7 @@ def find_tag_span(
                 else:
                     candidates = [
                         _aligned_find(block, item, index, unit, block_start)
-                        for item in (tokens["double"], tokens["single"], tokens["gt"])
+                        for item in (tokens["double"], tokens["single"], tokens["gt"], tokens["lt"])
                     ]
                     positions = [item for item in candidates if item >= 0]
                     if not positions:
@@ -397,6 +414,8 @@ def find_tag_span(
                         continue
                     found = min(positions)
                     token = block[found : found + unit]
+                    if token == tokens["lt"]:
+                        raise MalformedXMLStructure(f"Unclosed XML tag at byte {tag_start}")
                     if token == tokens["gt"]:
                         end = block_start + found + unit
                         return XMLTagSpan(
@@ -429,6 +448,7 @@ class AttributeRead:
     values: dict[str, str] = field(default_factory=dict)
     truncated: list[TruncatedAttribute] = field(default_factory=list)
     duplicates: list[str] = field(default_factory=list)
+    matched_references: set[str] = field(default_factory=set)
 
 
 def read_tag_attributes(
@@ -439,6 +459,8 @@ def read_tag_attributes(
     encoding: XMLByteEncoding | None = None,
     handle: BinaryIO | None = None,
     force_capture_offsets: tuple[int, ...] = (),
+    reference_patterns: tuple[str, ...] = (),
+    ignore_case: bool = False,
     max_value_bytes: int = 1024 * 1024,
     chunk_size: int = 64 * 1024,
 ) -> AttributeRead:
@@ -458,6 +480,11 @@ def read_tag_attributes(
     remaining = span.end - span.start
     position = span.start
     force_offsets = set(force_capture_offsets)
+    reference_bytes = tuple((enc.encode(item), item) for item in reference_patterns)
+    if ignore_case:
+        reference_bytes = tuple((raw.lower(), label) for raw, label in reference_bytes)
+    overlap = max((len(raw) - unit for raw, _ in reference_bytes), default=0)
+    value_tail = b""
     own_handle = handle is None
     reader = handle or file_path.open("rb")
 
@@ -499,10 +526,49 @@ def read_tag_attributes(
             if not block:
                 break
             remaining -= len(block)
-            for index in range(0, len(block), unit):
+            index = 0
+            while index < len(block):
+                if state == "quoted_value":
+                    # Skip/capture runs of bytes, including values that are not
+                    # selected. Decode only the bounded captured value.
+                    end = _aligned_find(block, enc.encode(chr(quote)), index, unit, position)
+                    stop = len(block) if end < 0 else end
+                    segment = block[index:stop]
+                    probe = value_tail + segment
+                    search = probe.lower() if ignore_case else probe
+                    reference_hits = []
+                    for raw, label in reference_bytes:
+                        found = _aligned_find(search, raw, 0, unit, position + index - len(value_tail))
+                        if found >= 0:
+                            result.matched_references.add(label)
+                            reference_hits.append(found)
+                    captured = segment
+                    if not should_capture:
+                        hits = reference_hits + [len(value_tail) + offset - position - index
+                                                for offset in force_offsets
+                                                if position + index <= offset < position + stop]
+                        if hits:
+                            should_capture = True
+                            forced_late = True
+                            captured = probe[min(hits):]
+                    value_length += stop - index
+                    if should_capture:
+                        available = max(0, max_value_bytes - len(value))
+                        available -= available % unit
+                        value.extend(captured[:available])
+                    value_tail = probe[-overlap:] if overlap else b""
+                    if end < 0:
+                        break
+                    finish_value()
+                    state = "before_name"
+                    index = end + unit
+                    continue
                 token = block[index : index + unit]
                 absolute = position + index
-                char = ord(enc.decode(token)) if token else -1
+                # Delimiters are ASCII; do not decode individual UTF-8 bytes
+                # or UTF-16 surrogate halves.
+                char = int.from_bytes(token, "big" if enc.codec == "utf-16-be" else "little")
+                index += unit
                 if state == "open":
                     if char == ord("<"):
                         state = "tag_name"
@@ -516,6 +582,8 @@ def read_tag_attributes(
                         continue
                     if char == ord(">"):
                         return result
+                    if char in b"<=\"'":
+                        raise MalformedXMLStructure(f"Invalid attribute at byte {absolute}")
                     name.clear()
                     name.extend(token)
                     state = "name"
@@ -530,7 +598,7 @@ def read_tag_attributes(
                     elif char in b" \t\r\n":
                         state = "after_name"
                     elif char in b"/>":
-                        state = "before_name"
+                        raise MalformedXMLStructure(f"Attribute without a value at byte {absolute}")
                     elif len(name) < 4096:
                         name.extend(token)
                     continue
@@ -544,49 +612,19 @@ def read_tag_attributes(
                         value_length = 0
                         state = "before_value"
                     else:
-                        state = "before_name"
+                        raise MalformedXMLStructure(f"Attribute without '=' at byte {absolute}")
                     continue
                 if state == "before_value":
                     if char in b" \t\r\n":
                         continue
                     if char in (ord('"'), ord("'")):
                         quote = char
+                        value_tail = b""
                         state = "quoted_value"
                     else:
-                        if absolute in force_offsets and not should_capture:
-                            should_capture = True
-                            forced_late = True
-                        value_length += len(token)
-                        if should_capture and len(value) < max_value_bytes:
-                            value.extend(token)
-                        state = "bare_value"
-                    continue
-                if state == "quoted_value":
-                    if char == quote:
-                        finish_value()
-                        state = "before_name"
-                    else:
-                        if absolute in force_offsets and not should_capture:
-                            should_capture = True
-                            forced_late = True
-                        value_length += len(token)
-                        if should_capture and len(value) < max_value_bytes:
-                            value.extend(token)
-                    continue
-                if char in b" \t\r\n/>":
-                    finish_value()
-                    state = "before_name"
-                    if char == ord(">"):
-                        return result
-                else:
-                    if absolute in force_offsets and not should_capture:
-                        should_capture = True
-                        forced_late = True
-                    value_length += len(token)
-                    if should_capture and len(value) < max_value_bytes:
-                        value.extend(token)
+                        raise MalformedXMLStructure(f"Unquoted attribute value at byte {absolute}")
             position += len(block)
     finally:
         if own_handle:
             reader.close()
-    return result
+    raise MalformedXMLStructure(f"Incomplete attributes in tag at byte {span.start}")

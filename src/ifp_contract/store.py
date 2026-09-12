@@ -145,13 +145,20 @@ CREATE INDEX IF NOT EXISTS idx_diagnostics_code ON diagnostics(code);
 class ContractStore:
     """Fresh, compact SQLite materialization for one extraction run."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, readonly: bool = False) -> None:
         self.path = Path(path)
+        if readonly:
+            self.connection = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA query_only = ON")
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = DELETE")
+        self.connection.execute("PRAGMA temp_store = FILE")
+        self.connection.create_function("casefold", 1, lambda value: (value or "").casefold(), deterministic=True)
         self.connection.executescript(SCHEMA)
         self._migrate()
         self.connection.commit()
@@ -460,6 +467,9 @@ class ContractStore:
 
     def rows(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         return list(self.connection.execute(sql, parameters))
+
+    def iter_rows(self, sql: str, parameters: tuple[Any, ...] = ()) -> Iterable[sqlite3.Row]:
+        return self.connection.execute(sql, parameters)
 
     def counts(self) -> dict[str, int]:
         return {

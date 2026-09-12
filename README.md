@@ -72,12 +72,14 @@ progress and prints percentage, file number, stage, MiB read, average MiB/s and
 ETA every few seconds. Use `--quiet` to disable progress.
 
 Successful results are atomically published to the requested `.db`. The scan
-commits one IFP at a time to `<db>.partial`; rerunning the same command reuses
-unchanged completed files. `--fresh` forces a complete rescan. If a file is
-unreadable, malformed or has an unsupported encoding, the command returns 1,
-keeps the partial checkpoint and leaves an existing successful database
-untouched. After repairing the file, rerun the same command to retry only that
-file.
+commits one matching IFP at a time to `<db>.partial`; rerunning the same command
+reuses unchanged matching files. Completed files with no target reference are
+not persisted in `scan_files`, so the database never becomes a whole-corpus
+file index; those cheap byte searches run again on a later build. `--fresh`
+forces a complete rescan. If a file is unreadable, malformed or has an
+unsupported encoding, the command returns 1, keeps the partial checkpoint and
+leaves an existing successful database untouched. After repairing the file,
+rerun the same command to retry it.
 
 Exit codes are: `0` complete, `1` incomplete/error, `2` complete but
 `--strict` found unknown or unresolved evidence, and `130` interrupted.
@@ -119,6 +121,10 @@ SQLite stores only:
 - Product/Phase ownership and narrow caller-to-API-operation links;
 - unknown Rule/reference evidence and its exact file byte offset.
 
+This focused storage policy is global. It does not require a depth, component,
+database-size or indexing-mode command-line option. Files with no selected
+reference leave no per-file row in the result database.
+
 The original IFP files remain the source of truth.  A 4 GB corpus is scanned
 as bytes to find the reference, but is never materialised or semantically
 indexed as a global XML graph. For an exact reference hit, the extractor seeks
@@ -135,6 +141,19 @@ ignored. UTF-8, ASCII-compatible declared encodings, UTF-16 LE and UTF-16 BE are
 handled while preserving original byte offsets. Selected attribute values are
 bounded to 1 MiB with an explicit truncation diagnostic; malformed tags have a
 bounded 512 MiB search window instead of an unbounded allocation.
+
+A Rule with incompatible or malformed attributes is recorded as
+`INCOMPATIBLE_RULE`, with its file offset and failure reason, and the scanner
+continues to later Rules in the same file and to other files. These diagnostics
+do not prevent publication; `--strict` returns 2 so they can be reviewed.
+Unreadable files, unsupported file encodings and unclosed global XML sections
+(such as comments or CDATA) still make the build incomplete. Even a failed
+integrator scan does not stop collecting caller evidence in the partial DB.
+
+An explicit caller Product that does not match any API Product remains
+unresolved. Single-Product/operation fallback applies only when the caller
+does not specify a target. Enabling dynamic-reference diagnostics preserves
+explicit references on the same Rule, regardless of attribute order.
 
 ## Custom Rule classes and attribute names
 
@@ -208,13 +227,14 @@ CLI / atomic checkpoint
 
 The normal build sequence is:
 
-1. Enumerate only `.ifp` paths and collect file size/mtime metadata.
+1. Walk `.ifp` metadata to calculate progress totals, then enumerate paths
+   again during scanning without retaining a whole-corpus file list.
 2. Stream the selected Data Integrator once for `DataSource`, `Product`,
-   `Phase`, and `Rule` start tags.
+   `Phase`, and `Rule` start tags, writing selected results directly to SQLite.
 3. Search every other IFP for the configured reference bytes. Seek back and
    parse selected attributes only when a visible reference is found.
 4. Commit each completed caller IFP to the partial SQLite database.
-5. Resolve caller Products to API operations, optionally compact unused pages,
+5. Resolve caller Products through a temporary SQLite lookup, optionally compact unused pages,
    validate SQLite, then atomically replace the requested database.
 
 ### Invariants to preserve
@@ -224,7 +244,10 @@ details:
 
 - Never call `read_text()` or `read_bytes()` on an IFP in production code and
   never build an XML DOM/tree for a complete file.
-- Memory use must depend on chunk/tag limits, not corpus or file size.
+- Scan buffers must depend on chunk/tag limits, not corpus or file size.
+  Product/Phase nesting and distinct Rule-class vocabulary are tracked in
+  memory; operation rows, caller rows and file inventories must not accumulate
+  in Python lists during a build.
 - Do not create a whole-project node/edge graph or persist unrelated screen
   properties. SQLite contains only the contract slice.
 - Keep `tag_offset` in original file bytes. Encoding conversion must not alter
@@ -235,9 +258,14 @@ details:
   it. Aggregate non-reference Rule classes only inside the selected integrator.
 - Keep dynamic references opt-in because they cannot prove an integrator
   target and can create substantial noise.
+- Isolate recoverable Rule parsing failures and retain an `INCOMPATIBLE_RULE`
+  diagnostic; do not stop the remaining Rule or corpus scan.
 - A failed or interrupted scan must not replace the last successful database.
   Completed files remain reusable in `<db>.partial`.
-- A report reads SQLite only; it must never trigger another corpus scan.
+- A report opens SQLite read-only, without migrations, and must never trigger
+  another corpus scan. Rebuild an older schema before reporting if it lacks
+  required fields. Report rendering currently uses memory proportional to
+  the extracted contract slice.
 
 ### Extending extraction safely
 
@@ -281,7 +309,7 @@ During development, `--fresh` is also useful for forcing a clean comparison.
 | `caller_operation_links` | Narrow caller-to-operation resolution with exact/fallback status. |
 | `diagnostics` | Unknown, ambiguous, malformed, truncated or unsupported evidence with byte offsets. |
 | `rule_class_census` | Aggregated RuleClassName counts from the selected integrator only. |
-| `scan_files` | File identity, checkpoint status and per-file result counts used for resume. |
+| `scan_files` | Identity/checkpoint rows for reference hits and failed files only; corpus misses are never indexed. |
 | `metadata` | Scan identity, options, status and summary counts. |
 
 Useful investigation commands:

@@ -73,3 +73,46 @@ def test_utf32_is_rejected_explicitly_instead_of_misread_as_utf16(tmp_path):
     path.write_text("<Project />", encoding="utf-32")
     with pytest.raises(UnsupportedIFPEncoding, match="UTF-32"):
         detect_xml_encoding(path)
+
+
+@pytest.mark.parametrize("codec,bom", [("utf-8", b""), ("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff")])
+def test_unknown_reference_crossing_chunks_is_captured(codec, bom, tmp_path):
+    path = tmp_path / "reference.ifp"
+    content = '<Rule Ignored="' + 'x' * 101 + 'DataIntegrator.ifp/尾部😀" Name="查询😀" />'
+    path.write_bytes(bom + content.encode(codec))
+    span = find_tag_span(path, len(bom), containing=False)
+    result = read_tag_attributes(
+        path, span, lambda name: name == "Name", reference_patterns=("DataIntegrator.ifp",), chunk_size=10,
+    )
+    assert result.values["Name"] == "查询😀"
+    assert result.values["Ignored"] == "…DataIntegrator.ifp/尾部😀"
+    assert result.matched_references == {"DataIntegrator.ifp"}
+
+
+def test_large_ignored_attribute_is_skipped_without_per_byte_decoding(tmp_path, monkeypatch):
+    from ifp_contract.xmlbytes import XMLByteEncoding
+
+    path = tmp_path / "payload.ifp"
+    path.write_bytes(b'<Rule Payload="' + b'x' * (4 * 1024 * 1024) + b'" Name="ok" />')
+    span = find_tag_span(path, 0, containing=False)
+    decode = XMLByteEncoding.decode
+    calls = 0
+
+    def counted(self, raw):
+        nonlocal calls
+        calls += 1
+        return decode(self, raw)
+
+    monkeypatch.setattr(XMLByteEncoding, "decode", counted)
+    result = read_tag_attributes(path, span, lambda name: name == "Name")
+    assert result.values == {"Name": "ok"}
+    assert calls < 20
+
+
+def test_visible_dense_matches_match_expected_offsets_across_sections(tmp_path):
+    path = tmp_path / "dense.ifp"
+    content = (b'<Rule Name="ok"/><!-- <Rule hidden="yes"/> -->' * 300)
+    path.write_bytes(content)
+    expected = [index for index in range(len(content)) if content.startswith(b'<Rule Name=', index)]
+    matches = list(iter_xml_visible_matches(path, ("<Rule", "<Product", "<Phase"), chunk_size=73))
+    assert [match.offset for match in matches] == expected

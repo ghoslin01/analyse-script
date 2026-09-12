@@ -51,6 +51,12 @@ def test_build_keeps_only_direct_odata_contracts_and_caller_mappings(tmp_path):
         assert summary.odata_operations == 1
         assert summary.caller_references == 1
         assert summary.caller_mappings == 2
+        # The corpus is read, but only the matching caller is checkpointed;
+        # Unrelated.ifp must not become part of a whole-project file index.
+        assert [row["file_path"] for row in store.rows(
+            "SELECT file_path FROM scan_files ORDER BY file_path"
+        )] == [str(corpus / "Caller.ifp")]
+        assert store.metadata_value("storage_policy") == "reference_hits_only"
         assert store.counts() == {
             "odata_operations": 1,
             "caller_references": 1,
