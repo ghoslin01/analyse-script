@@ -1,0 +1,61 @@
+{
+  "api_rule_classes": [
+    "com.temenosconnect.odata.rule.ReadRule",
+    "com.temenosconnect.odata.rule.CreateRule",
+    "com.temenosconnect.odata.rule.UpdateRule",
+    "com.temenosconnect.odata.rule.DeleteRule",
+    "com.temenosconnect.odata.rule.CompleteRule",
+    "com.temenosconnect.odata.rule.InitRule",
+    "com.temenosconnect.odata.rule.FunctionRule",
+    "com.temenosconnect.odata.rule.ContextualSearchRule",
+    "com.temenosconnect.odata.rule.CountRule",
+    "com.temenosconnect.odata.rule.TranslateRule"
+  ],
+  "method_by_rule_class_suffix": {
+    "ReadRule": "GET",
+    "CreateRule": "POST",
+    "UpdateRule": "PATCH",
+    "DeleteRule": "DELETE",
+    "CompleteRule": "POST",
+    "InitRule": "POST",
+    "FunctionRule": "POST",
+    "ContextualSearchRule": "GET",
+    "CountRule": "GET",
+    "TranslateRule": "GET"
+  },
+  "attribute_aliases": {
+    "filter": ["QueryOptions"]
+  },
+  "api_rule_attributes": {
+    "ReadRule": {
+      "output": ["DatastoreGroup"]
+    },
+    "ContextualSearchRule": {
+      "output": ["DatastoreGroup"]
+    },
+    "CountRule": {
+      "output": ["DatastoreGroup"]
+    },
+    "TranslateRule": {
+      "output": ["DatastoreGroup"]
+    },
+    "CreateRule": {
+      "context": ["DatastoreGroup"]
+    },
+    "UpdateRule": {
+      "context": ["DatastoreGroup"]
+    },
+    "DeleteRule": {
+      "context": ["DatastoreGroup"]
+    },
+    "CompleteRule": {
+      "context": ["DatastoreGroup"]
+    },
+    "InitRule": {
+      "context": ["DatastoreGroup"]
+    },
+    "FunctionRule": {
+      "context": ["DatastoreGroup"]
+    }
+  }
+}

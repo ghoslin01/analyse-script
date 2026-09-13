@@ -1,0 +1,11 @@
+{
+  "name": "Full mode, Continue button",
+  "trigger_eid": "sample-continue-button",
+  "assumptions": [
+    {
+      "field": "Form[1].Mode",
+      "operator": "eq",
+      "value": "Full"
+    }
+  ]
+}

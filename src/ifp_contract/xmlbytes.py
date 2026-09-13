@@ -574,6 +574,8 @@ def read_tag_attributes(
                         state = "tag_name"
                     continue
                 if state == "tag_name":
+                    if char == ord(">"):
+                        return result
                     if char in b" \t\r\n/>":
                         state = "before_name"
                     continue

@@ -110,6 +110,258 @@ four caller mappings, three exact Product-to-operation links, and one retained
 unknown-Rule diagnostic. `UnrelatedScreen.ifp` is read as bytes but creates no
 contract row.
 
+## Trace a field or rule without a database
+
+`trace` reads the IFP files reached from a selected entry and exports a portable
+evidence bundle. It follows assignments, conditions, component mappings and
+shared Rule references. It does not require `build` or a SQLite database.
+
+For a field in an application screen (replace these synthetic paths with your project):
+
+```powershell
+ifp-contract trace D:\ifp-project\components `
+  --file Screens/OrderEntry.ifp `
+  --field 'Form[1].Amount' `
+  --entry Order.Input `
+  --path-var LIBRARY_HOME=. `
+  --output D:\tmp\amount-trace
+```
+
+The output directory contains:
+
+- `summary.md`: a bounded Chinese reading guide to target writes, their
+  prerequisites, scenario exclusions, API candidates and remaining questions.
+- `report.md`: the readable trace, execution prerequisites, source dependencies
+  and unresolved boundaries.
+- `evidence.json`: versioned structural evidence, raw behavioral attributes,
+  exact mapping attributes, file offsets/lines, file fingerprints and separate
+  contexts for different calls and entries.
+- `next.json`: an editable request containing the anchors, limits, path-variable
+  substitutions, previous fingerprints and pending evidence. If a rules config
+  was supplied, a copy is included as `rules-config.json`.
+
+These files can be moved out of an isolated network for analysis. Follow-up
+requests can add entries to `targets`, refine an `entry`, or increase limits.
+For example, repeat collection with an increased context budget:
+
+```powershell
+ifp-contract trace D:\ifp-project\components `
+  --request D:\tmp\amount-trace\next.json `
+  --max-contexts 10000 `
+  --output D:\tmp\amount-trace-next
+```
+
+This **recollects the requested scopes**; it does not resume a suspended runtime
+or silently discover new callers. Changes to previously collected files are
+reported. The `pending` section is evidence for deciding the next targets, not
+an executable work queue. Input fields whose writers are outside the selected
+scope remain explicit external/unresolved inputs.
+
+Use `--rule-eid EID` instead of `--field` to anchor a rule. `--entry` normally
+selects `Product.Phase`; `--entry @EID` inspects an isolated shared rule without
+claiming its caller conditions. Omitting `--entry` considers the file's phases
+separately and may require a larger budget. Dynamic component path prefixes
+require explicit `--path-var NAME=PATH`; `LIBRARY_HOME` has no built-in value.
+
+Default budgets are 50 reached files and 5,000 expanded contexts per target.
+`--max-files` and `--max-contexts` change these. Hitting a limit preserves partial
+evidence and diagnostics. The collector indexes structural metadata in reached
+files (up to 100,000 structural nodes per file); its memory use depends on that
+metadata and the context budget. It does not build a full XML DOM or index the
+entire corpus. Individual captured attribute values are limited to 1 MiB and
+raw behavioral evidence per node to 128 KiB; omissions are diagnosed explicitly.
+
+The trace preserves both the condition that produced a value and the condition
+that consumes it. `RuleType=False` is kept as a false branch, `[C]`/`[A]` remain
+symbolic, and instance-setting/increment rules stay attached to loop evidence.
+Question and button rules retain their UI event contexts; XML order between
+separate UI events is **not** treated as runtime order. UI `ConditionExpression`
+and applicability attributes are retained as configuration, without assuming
+the engine's activation semantics.
+
+This is conservative static analysis, not a UXP interpreter. Multiple writes,
+cross-event dependencies and runtime values may remain unresolved. Phase jumps,
+unknown rules and recursive calls are explicit boundaries. Unknown rules retain
+raw evidence and are not assumed harmless. Current support includes
+ContainerRule, EvaluateRule, SetValueRule, ExpressionRule, RepeatRule,
+IncrementorRule, ResetDataRule and CallComponentRule, plus configured API rules.
+API inputs include both query groups and payload groups. Call-site `In`/`Out`
+flags enable mappings; published `PubIn`/`PubOut` alone do not.
+
+Project-specific classes can opt into an existing supported interpretation:
+
+```json
+{
+  "trace_rule_kinds": {
+    "vendor.CustomEvaluationRule": "evaluate",
+    "vendor.CustomSetRule": "set"
+  }
+}
+```
+
+Supported kind names are `container`, `evaluate`, `set`, `expression`, `repeat`,
+`increment`, `reset`, `call`, and `goto`. This mapping asserts that the class uses
+the supported attribute semantics; it does not infer custom implementation
+behavior. Existing API class, HTTP method and API attribute-alias settings in
+`--rules-config` also apply. Trace does not add new alias concepts to the API
+configuration or change existing `build` results.
+
+### Extend the standard trace rules
+
+The standard rule library stays enabled. `trace.rules` adds project semantics;
+it does not replace the whole library. See
+[`examples/trace-project-config.json`](examples/trace-project-config.json).
+Pass this JSON with `--rules-config`; API settings can coexist in the same file.
+
+Each extension declares `class`, `kind`, optional `attributes`, `defaults`,
+`branch_attribute`, and `branches`. Attribute mappings run from the supported
+canonical name to the project's XML attribute name. For example,
+`"PropertyName": "DestinationPath"` and `"FromPropertyName": "SourcePath"`
+adapt an assignment; `"defaults": {"FromType": "Data Item"}` makes its source
+a field instead of the standard literal-value default. An explicit attribute
+mapping replaces that canonical attribute, including when the project attribute
+is absent. Defaults only fill absent canonical attributes. Original XML evidence
+and the normalized attributes are both retained.
+
+Supported canonical attributes are:
+
+| Area | Attributes |
+| --- | --- |
+| Assignment | `Type`, `FromType`, `PropertyName`, `VariableName`, `PropertyGroupName`, `PropertyGroupInstanceName`, `FromPropertyName`, `FromVariableName`, `FromPropertyGroupName`, `FromPropertyGroupInstanceName`, `FromValue`, `Trim` |
+| Conditions/expressions | `Expression`, `OutputProperty` |
+| Reset | `ResetProperty`, `ResetPropertyGroup`, `ResetVariable` |
+| Iteration | `IncrementBy`, `EndInstance`, `DataGroupName` |
+| Calls/references | `SelectComponent`, `ComponentList`, `Source`, `LinkReference`, `RuleDisabled` |
+| Phase transitions | `Phase`, `OperationType` |
+
+A qualified class matches exactly; a bare class name matches its suffix,
+case-insensitively. Exact matches take precedence. Overriding or specializing an
+existing class requires `"override": true`. Duplicate classes, unknown keys,
+ambiguous attribute mappings and invalid branch definitions fail validation.
+`branch_attribute` names the attribute on the condition's **children**;
+`branches` maps project labels to JSON booleans, e.g. `{"pass": true, "fail": false}`.
+Unrecognized labels on an extended evaluation remain unresolved guards.
+
+The legacy `trace_rule_kinds` setting remains supported for additive suffix
+aliases using the standard attributes. Evidence includes an effective semantics
+fingerprint and API configuration; the complete custom configuration is copied
+into the bundle for offline replay. These extensions declare existing supported
+semantics, not arbitrary executable plugins. XML structure, expression syntax,
+component mapping format and engine-specific side effects are not universally
+configurable in this version.
+
+### Explain a specific scenario
+
+Add `--scenario examples/trace-scenario.json` to a trace. A scenario contains an
+optional `name`, a `trigger_eid` identifying a reached Question or Button in the
+starting file, and `assumptions`: concrete field paths with `operator: "eq"` and
+string `value`. Session fields use the `!` prefix. Select one entry explicitly;
+UI scenarios require a unique trigger. For a phase with no UI events the trigger
+can be omitted. Scenarios are embedded in `next.json` per target, so replay does
+not require the original scenario file. A CLI scenario overrides each requested
+target's scenario; otherwise each target retains its own.
+
+Assumptions describe **initial values of the selected activation**, not values
+observed at runtime or invariants that survive writes. The analyzer supports
+string `==`/`!=`, `AND`/`OR`/`NOT`, parentheses, and whole-field substitutions,
+including quoted references. It propagates literal and field assignments and
+concrete component mappings in the same event context. It does not execute
+expressions or infer numeric coercion. Unsupported functions, escapes, dynamic
+instances, loops, resets, unknown effects and unresolved conditional writes
+remain unknown. A later known assignment replaces the initial assumed value.
+Constants are not propagated between separate UI events. Symbolic mapping
+indices are not treated as concrete array instances.
+
+The scenario is an overlay: **excluded paths remain in the original evidence**.
+Events are labeled `candidate`, `excluded` (with the excluding condition IDs),
+or `other_event_context`. Candidate means possible under remaining prerequisites,
+not guaranteed. Condition evidence includes the expression tree, values used,
+and their assumption/assignment/copy provenance or an unknown reason.
+`summary.md` leads with target paths; `report.md` and `evidence.json` retain the
+full reasoning. Existing unresolved-input diagnostics and `--strict` behavior
+still describe the full static evidence, including paths excluded by a scenario.
+
+### Temenos OData rule family and conditional request templates
+
+[`examples/temenos-odata-config.json`](examples/temenos-odata-config.json)
+adapts the ten configured `com.temenosconnect.odata.rule` classes. It applies
+the configured GET/POST/PATCH/DELETE method fallbacks, `QueryOptions` as the
+query/filter attribute, and shared request metadata. `ReadRule`,
+`ContextualSearchRule`, `CountRule`, and `TranslateRule` treat `DatastoreGroup`
+as an output. For the six mutating/action classes it is retained as context with
+no assumed direction. This distinction is a profile decision and can be changed
+per class through `api_rule_attributes` when a project has firmer semantics.
+The file is additive: standard rules stay enabled.
+
+| Rule suffix | Fallback method | `DatastoreGroup` profile |
+| --- | --- | --- |
+| `ReadRule` | `GET` | output |
+| `CreateRule` | `POST` | context, direction unresolved |
+| `UpdateRule` | `PATCH` | context, direction unresolved |
+| `DeleteRule` | `DELETE` | context, direction unresolved |
+| `CompleteRule` | `POST` | context, direction unresolved |
+| `InitRule` | `POST` | context, direction unresolved |
+| `FunctionRule` | `POST` | context, direction unresolved |
+| `ContextualSearchRule` | `GET` | output |
+| `CountRule` | `GET` | output |
+| `TranslateRule` | `GET` | output |
+
+An explicit method attribute still takes precedence over the suffix fallback.
+
+For every configured API class, a present `Payload` is preserved as a symbolic
+JSON template. Its `$%IF` branches and `$$...$` substitutions become request dependencies, but
+the JSON is never rendered or sent. `HttpCodeDataItem` and
+`HttpMessageDataItem` are trace write targets. A nested API Rule inherits an
+ancestor's `RuleDisabled` state in `build` output; `trace` does not enter that
+disabled subtree. A child `RuleType` is only a branch label relative to its
+parent—it does not by itself establish that an API call will execute.
+
+The synthetic conditional-read example can be traced directly:
+
+```powershell
+ifp-contract trace .\examples `
+  --file odata-conditional-read.ifp `
+  --field 'Response[1].Records[C]' `
+  --entry 'Lookup.ConditionalRead' `
+  --rules-config .\examples\temenos-odata-config.json `
+  --output D:\tmp\conditional-read-trace
+```
+
+The same config works with `build --rules-config ...` and its `report` output.
+`ServiceRootUri` on a Rule supplies its base URL before any referenced DataSource.
+An ambiguous `Endpoint` used as the request path is not also treated as a base
+URL. `HTTPHeaderName`, `HTTPHeaderValue`, and `AcceptLanguage` are retained and
+their parameter dependencies are traced. Their alias concepts are `header_name`,
+`header_value`, and `language`, so projects can add alternative attribute names.
+
+Templates using `$%IF condition$`, `$%ELSE$`, and `$%ENDIF$` retain their raw
+text, nested syntax tree, and conditional field dependencies in
+`event.api.templates`. Plain paths in predicates such as
+`Request[1].AsAtDate != null` are dependencies even without `$$...$`.
+Path templates enumerate up to 32 syntactic alternatives with branch guards.
+Query templates show conditional fragments, including `and` versus `$filter=`;
+they are not expanded into every parameter combination. Malformed or limited
+templates carry a diagnostic rather than partial, apparently complete URLs.
+
+The synthetic example has three path alternatives: a selected portfolio, else a
+collection when CollectionKey is non-null, else a customer. Its date, region and
+archive query fragments preserve their own prerequisites.
+Template conditions describe request construction; they are **not** gates for
+whether the ReadRule executes. `RuleType="PostPhase"` and the phase's
+`ProcessRulesOnly` remain separate configuration evidence.
+
+Null predicates, date functions (`year()`, `month()`, `day()`), URL escaping and
+engine whitespace handling are not executed or solved. XML entities are decoded
+while raw template whitespace/newlines are preserved. Template alternatives are
+symbolic even when a trace scenario is supplied; the scenario solver does not
+yet select these routes or render a final URL. Reports label dynamic requests as
+templates rather than resolved runtime requests.
+
+Exit status is `0` for successful collection (which can include unresolved
+evidence), `1` for file/collection errors, `2` with `--strict` when issues or
+external inputs remain, and `130` for interruption. Interruption can be retried
+from the same command/request; there is no trace checkpoint database.
+
 ## Storage contract
 
 SQLite stores only:

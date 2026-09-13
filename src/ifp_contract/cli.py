@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .config import load_rule_config
+from .config import load_rule_config, DEFAULT_ALIASES
 from .extractor import ProgressUpdate, build_contracts
 from .store import ContractStore
+from .templates import template_evidence, template_markdown
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -66,6 +67,22 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--db", type=Path, required=True, help="database produced by build")
     report.add_argument("--format", choices=("markdown", "json"), default="markdown")
     report.add_argument("--output", type=Path, help="write output to this file instead of stdout")
+
+    trace = commands.add_parser("trace", help="trace fields/rules across IFP files into a portable evidence bundle")
+    trace.add_argument("root", type=Path, help="component root; no database required")
+    trace.add_argument("--file", type=Path, help="starting IFP, relative to root")
+    anchor = trace.add_mutually_exclusive_group()
+    anchor.add_argument("--field", help="field path to trace backwards")
+    anchor.add_argument("--rule-eid", help="rule eid to trace")
+    trace.add_argument("--entry", help="Product.Phase, or @eid for an isolated shared rule")
+    trace.add_argument("--request", type=Path, help="next.json or an edited collection request")
+    trace.add_argument("--output", type=Path, required=True, help="directory for report.md, evidence.json, next.json")
+    trace.add_argument("--rules-config", type=Path)
+    trace.add_argument("--scenario", type=Path, help="JSON scenario: trigger_eid and initial string field assumptions")
+    trace.add_argument("--path-var", action="append", help="explicit component path substitution, e.g. LIBRARY_HOME=.")
+    trace.add_argument("--max-files", type=int)
+    trace.add_argument("--max-contexts", type=int)
+    trace.add_argument("--strict", action="store_true")
     return parser
 
 
@@ -76,7 +93,7 @@ def _markdown(store: ContractStore) -> str:
         SELECT id, rule_eid, rule_name, rule_class, product_name, product_eid,
                phase_name, classification, rule_type, disabled,
                source_name, base_url, action, api_path, filter_expr, request_group,
-               target_group, results_group, output_group
+               target_group, results_group, output_group, attributes_json
         FROM odata_operations ORDER BY tag_offset
         """
     )
@@ -156,6 +173,8 @@ def _markdown(store: ContractStore) -> str:
     if not operations:
         lines.append("No OData/API Rule was recognized. Check the RuleClassName or source attributes in the integrator IFP.")
     for operation in operations:
+        request_label = ('API request template' if any('$' in (operation[k] or '') for k in ('base_url', 'api_path'))
+                         else 'Effective API request')
         lines.extend(
             [
                 f"### {_inline(operation['rule_name']) or _inline(operation['rule_eid']) or 'Unnamed operation'}",
@@ -163,13 +182,14 @@ def _markdown(store: ContractStore) -> str:
                 f"- Rule: `{_inline(operation['rule_class'])}`",
                 f"- Product/operation: `{_inline(operation['product_name'])}`",
                 f"- Phase: `{_inline(operation['phase_name'])}`",
+                f"- Rule scheduling configuration: `{_inline(operation['rule_type'])}`",
                 f"- Classification: `{_inline(operation['classification'])}`",
                 f"- Disabled: `{'yes' if operation['disabled'] else 'no'}`",
                 f"- OData/API source: `{_inline(operation['source_name'])}`",
                 f"- Base endpoint: `{_inline(operation['base_url'])}`",
                 f"- Method/action: `{_inline(operation['action'])}`",
                 f"- API path: `{_inline(operation['api_path'])}`",
-                f"- Effective API request: `"
+                f"- {request_label}: `"
                 f"{_inline(operation['action'])} "
                 f"{_inline(_joined_api_path(operation['base_url'], operation['api_path']))}`",
                 f"- Filter/query: `{_inline(operation['filter_expr'])}`",
@@ -180,6 +200,33 @@ def _markdown(store: ContractStore) -> str:
                 "",
             ]
         )
+        for concept, value in [('path', operation['api_path']), ('query', operation['filter_expr'])]:
+            if value and '$%' in value:
+                lines += template_markdown(concept, template_evidence(value, variants=concept == 'path'))
+        rule_config = json.loads(metadata.get('rule_config', '{}'))
+        aliases = rule_config.get('aliases', DEFAULT_ALIASES)
+        class_attributes = rule_config.get('api_rule_attributes', {}).get(
+            str(operation['rule_class']).rsplit('.', 1)[-1].casefold(), {}
+        )
+        attributes = {k.casefold(): v for k, v in json.loads(operation['attributes_json']).items()}
+        def attribute_value(concept):
+            names = tuple(dict.fromkeys(tuple(aliases.get(concept, DEFAULT_ALIASES[concept])) +
+                                        tuple(class_attributes.get(concept, ()))))
+            return next((attributes[name.casefold()] for name in names
+                          if attributes.get(name.casefold())), None)
+        for concept in ('header_name', 'header_value', 'language', 'context'):
+            value = attribute_value(concept)
+            if value:
+                lines.append(f"- {concept}: `{_inline(value)}`")
+        payload = attribute_value('payload')
+        if payload:
+            lines.append('- Manual payload/template is retained below; it is not treated as a data group.')
+            lines += template_markdown('payload', template_evidence(payload))
+        for concept in ('error_code', 'error_message'):
+            value = attribute_value(concept)
+            if value:
+                lines.append(f"- {concept} output: `{_inline(value)}`")
+        lines.append('')
 
     lines.extend(["## API / OData data sources", ""])
     if not data_sources:
@@ -442,6 +489,16 @@ def _duration(seconds: float) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "trace":
+        from .trace_report import run_trace
+        try:
+            return run_trace(args)
+        except KeyboardInterrupt:
+            print("INTERRUPTED: rerun the trace request", file=sys.stderr)
+            return 130
+        except (OSError, ValueError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
     if args.command == "build":
         references = args.reference or [args.integrator.name]
         progress = None if args.quiet else _ProgressPrinter()

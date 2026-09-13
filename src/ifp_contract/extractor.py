@@ -87,11 +87,7 @@ def is_contract_attribute(
     lowered = name.casefold()
     if lowered in DIRECT_ATTRIBUTE_NAMES:
         return True
-    if any(
-        lowered == alias.casefold()
-        for aliases in rule_config.aliases.values()
-        for alias in aliases
-    ):
+    if any(lowered == alias.casefold() for alias in rule_config.all_attribute_names):
         return True
     if any(lowered.endswith(suffix.casefold()) for suffix in MAPPING_SUFFIXES):
         return True
@@ -123,16 +119,20 @@ def _truthy(value: str | None) -> bool:
 
 
 def _source_name(
-    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG
+    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG,
+    rule_class: str | None = None,
 ) -> str | None:
-    exact = _value(attributes, *rule_config.attribute_names("source"))
+    rule_class = rule_class or _value(attributes, "RuleClassName", "ClassType")
+    exact = _value(attributes, *rule_config.attribute_names_for_rule(rule_class, "source"))
     return exact or _value_ending_with(attributes, "source")
 
 
 def _api_path(
-    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG
+    attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG,
+    rule_class: str | None = None,
 ) -> str | None:
-    exact = _value(attributes, *rule_config.attribute_names("path"))
+    rule_class = rule_class or _value(attributes, "RuleClassName", "ClassType")
+    exact = _value(attributes, *rule_config.attribute_names_for_rule(rule_class, "path"))
     return exact or _value_ending_with(attributes, "path", "url", "uri")
 
 
@@ -141,6 +141,15 @@ def _base_url(
 ) -> str | None:
     exact = _value(attributes, *rule_config.attribute_names("base_url"))
     return exact or _value_ending_with(attributes, "url", "uri")
+
+
+def rule_base_url(attributes: dict[str, str], rule_config: RuleConfig) -> str | None:
+    # Endpoint is also a request-path alias: it cannot simultaneously supply a
+    # rule's base URL. Dedicated root attributes take precedence over DataSource.
+    rule_class = _value(attributes, "RuleClassName", "ClassType")
+    path_aliases = {name.casefold() for name in rule_config.attribute_names_for_rule(rule_class, 'path')}
+    return _value(attributes, *(name for name in rule_config.attribute_names_for_rule(rule_class, 'base_url')
+                                if name.casefold() not in path_aliases))
 
 
 def _value_ending_with(attributes: dict[str, str], *suffixes: str) -> str | None:
@@ -157,16 +166,13 @@ def _api_classification(
     rule_class = _rule_suffix(_value(attributes, "RuleClassName", "ClassType"))
     if rule_config.is_api_rule(rule_class):
         return "CONFIRMED"
-    method = _value(attributes, *rule_config.attribute_names("method")) or _value_ending_with(
+    method = _value(attributes, *rule_config.attribute_names_for_rule(rule_class, "method")) or _value_ending_with(
         attributes, "method"
     )
     path = _api_path(attributes, rule_config)
     source = _source_name(attributes, rule_config)
-    output = _value(
-        attributes,
-        *rule_config.attribute_names("output"),
-        *rule_config.attribute_names("result"),
-    )
+    output = _value(attributes, *rule_config.attribute_names_for_rule(rule_class, "output"),
+                    *rule_config.attribute_names_for_rule(rule_class, "result"))
     if method and path:
         return "STRUCTURAL"
     if path and (source or output):
@@ -374,10 +380,11 @@ def scan_integrator(
     api_shaped_unknown_classes: set[str] = set()
     product_stack: list[dict[str, str | None]] = []
     phase_stack: list[dict[str, str | None]] = []
+    rule_disabled_stack: list[bool] = []
     with file_path.open("rb") as random_handle:
         matches = iter_xml_visible_matches(
             file_path,
-            ("<DataSource", "<Product", "</Product", "<Phase", "</Phase", "<Rule"),
+            ("<DataSource", "<Product", "</Product", "<Phase", "</Phase", "<Rule", "</Rule"),
             encoding=encoding,
             on_bytes=on_bytes,
         )
@@ -399,7 +406,8 @@ def scan_integrator(
             if span is None or span.name != expected_name:
                 continue
             if span.is_end:
-                stack = product_stack if span.name == "Product" else phase_stack
+                stack = {"Product": product_stack, "Phase": phase_stack,
+                         "Rule": rule_disabled_stack}[span.name]
                 if stack:
                     stack.pop()
                 else:
@@ -473,12 +481,16 @@ def scan_integrator(
                         source_urls[name.casefold()] = base_url
                 continue
 
+            inherited_disabled = any(rule_disabled_stack)
+            effective_disabled = inherited_disabled or _truthy(_value(attributes, "RuleDisabled"))
+            if not span.self_closing:
+                rule_disabled_stack.append(effective_disabled)
             rule_class = _value(attributes, "RuleClassName", "ClassType") or "<missing>"
             scan.rule_classes[rule_class] += 1
             classification = _api_classification(attributes, rule_config)
             if classification is None:
                 continue
-            source_name = _source_name(attributes, rule_config)
+            source_name = _source_name(attributes, rule_config, rule_class)
             product = product_stack[-1] if product_stack else {}
             phase = phase_stack[-1] if phase_stack else {}
             scan.add("operations",
@@ -491,27 +503,28 @@ def scan_integrator(
                     "phase_name": phase.get("name"),
                     "classification": classification,
                     "rule_type": _value(attributes, "RuleType"),
-                    "disabled": int(_truthy(_value(attributes, "RuleDisabled"))),
+                    "disabled": int(effective_disabled),
                     "source_name": source_name,
-                    "base_url": source_urls.get((source_name or "").casefold()),
-                    "action": _value(attributes, *rule_config.attribute_names("method"))
+                    "base_url": rule_base_url(attributes, rule_config)
+                    or source_urls.get((source_name or "").casefold()),
+                    "action": _value(attributes, *rule_config.attribute_names_for_rule(rule_class, "method"))
                     or _value_ending_with(attributes, "method")
                     or rule_config.method_for_rule_class(rule_class),
-                    "api_path": _api_path(attributes, rule_config),
+                    "api_path": _api_path(attributes, rule_config, rule_class),
                     "filter_expr": _value(
-                        attributes, *rule_config.attribute_names("filter")
+                        attributes, *rule_config.attribute_names_for_rule(rule_class, "filter")
                     ),
                     "request_group": _value(
-                        attributes, *rule_config.attribute_names("request")
+                        attributes, *rule_config.attribute_names_for_rule(rule_class, "request")
                     ),
                     "target_group": _value(
-                        attributes, *rule_config.attribute_names("target")
+                        attributes, *rule_config.attribute_names_for_rule(rule_class, "target")
                     ),
                     "results_group": _value(
-                        attributes, *rule_config.attribute_names("result")
+                        attributes, *rule_config.attribute_names_for_rule(rule_class, "result")
                     ),
                     "output_group": _value(
-                        attributes, *rule_config.attribute_names("output")
+                        attributes, *rule_config.attribute_names_for_rule(rule_class, "output")
                     ),
                     "attributes": attributes,
                 }

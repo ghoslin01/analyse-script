@@ -1,0 +1,15 @@
+<!-- Synthetic fixture. It deliberately contains no customer project names, IDs, or endpoints. -->
+<Phase Name="Lookup.ConditionalRead" ProcessRulesOnly="Y" eid="sample-phase-01">
+  <Rule AcceptLanguage="$$Request[1].Locale$"
+        DatastoreGroup="Response[1].Records[C]"
+        HTTPHeaderName="$$Request[1].HeaderName$"
+        HTTPHeaderValue="$$Request[1].HeaderValue$"
+        Name="OData Read - conditional records"
+        QueryOptions="$orderby=DisplayName asc$%IF Request[1].AsAtDate != null$&amp;$filter=effectiveDate eq datetime'$$Request[1].AsAtDate.year()$-$$Request[1].AsAtDate.month()$-$$Request[1].AsAtDate.day()$T00:00:00'$%ENDIF$ $%IF Request[1].RegionCode != null$ $%IF Request[1].AsAtDate != null$ and $%ELSE$&amp;$filter=$%ENDIF$regionCode eq '$$Request[1].RegionCode$'$%ENDIF$ $%IF Request[1].IncludeArchived != null$ $%IF Request[1].AsAtDate != null or Request[1].RegionCode != null$ and $%ELSE$&amp;$filter=$%ENDIF$isArchived eq '$$Request[1].IncludeArchived$'$%ENDIF$"
+        ResourcePath="$%IF Context[1].Selection[1].PortfolioKey != null$Portfolios('$$Context[1].Selection[1].PortfolioKey$')$%ELSE$ $%IF Request[1].CollectionKey != null$Collections('$$Request[1].CollectionKey$')$%ELSE$Customers('$$Context[1].Selection[1].CustomerKey$')$%ENDIF$&#10;$%ENDIF$/recordTypes"
+        RuleClassName="com.temenosconnect.odata.rule.ReadRule"
+        RuleDisabled="N"
+        RuleType="PostPhase"
+        ServiceRootUri="$$Request[1].ServiceUri$"
+        eid="sample-read-01"/>
+</Phase>

@@ -20,6 +20,13 @@ DEFAULT_ALIASES: dict[str, tuple[str, ...]] = {
     "target": ("TargetDataGroup",),
     "result": ("ResultsDataGroup", "ResultDataGroup"),
     "output": ("OutputDataGroup", "Output"),
+    "payload": ("Payload",),
+    "error_code": ("HttpCodeDataItem", "ErrorCodeDataItem"),
+    "error_message": ("HttpMessageDataItem", "ErrorMsgDataItem"),
+    "context": (),
+    "header_name": ("HTTPHeaderName",),
+    "header_value": ("HTTPHeaderValue",),
+    "language": ("AcceptLanguage",),
     "selector": (
         "SelectComponent", "ComponentList", "Component", "ComponentName",
         "ComponentPath", "CallComponent", "TargetComponent", "Source", "SourceName",
@@ -50,6 +57,7 @@ class RuleConfig:
         default_factory=lambda: dict(DEFAULT_ALIASES)
     )
     method_by_rule_class_suffix: dict[str, str] = field(default_factory=dict)
+    api_rule_attributes: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
 
     @property
     def known_rule_classes(self) -> frozenset[str]:
@@ -57,6 +65,20 @@ class RuleConfig:
 
     def attribute_names(self, concept: str) -> tuple[str, ...]:
         return self.aliases.get(concept, ())
+
+    def attribute_names_for_rule(self, rule_class: str | None, concept: str) -> tuple[str, ...]:
+        """Return global aliases plus the declared attributes for this API class."""
+        custom = self.api_rule_attributes.get(_suffix(rule_class or "").casefold(), {}).get(concept, ())
+        return tuple(dict.fromkeys(self.attribute_names(concept) + custom))
+
+    @property
+    def all_attribute_names(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            name for aliases in (*self.aliases.values(),
+                                  *(names for entry in self.api_rule_attributes.values()
+                                    for names in entry.values()))
+            for name in aliases
+        ))
 
     def method_for_rule_class(self, value: str | None) -> str | None:
         candidate = _suffix(value or "").casefold()
@@ -88,6 +110,10 @@ class RuleConfig:
             "method_by_rule_class_suffix": dict(
                 sorted(self.method_by_rule_class_suffix.items())
             ),
+            "api_rule_attributes": {
+                rule_class: {concept: list(names) for concept, names in sorted(concepts.items())}
+                for rule_class, concepts in sorted(self.api_rule_attributes.items())
+            },
         }
 
 
@@ -134,6 +160,22 @@ def load_rule_config(path: str | Path | None) -> RuleConfig:
                 "to non-empty HTTP method strings"
             )
 
+    api_attributes = payload.get("api_rule_attributes", {})
+    if not isinstance(api_attributes, dict):
+        raise ValueError("api_rule_attributes must be a JSON object")
+    rule_attributes: dict[str, dict[str, tuple[str, ...]]] = {}
+    for rule_class, concepts in api_attributes.items():
+        if not isinstance(rule_class, str) or not _suffix(rule_class).strip() or not isinstance(concepts, dict):
+            raise ValueError("api_rule_attributes must map rule class names to objects")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for concept, names in concepts.items():
+            if concept not in DEFAULT_ALIASES:
+                raise ValueError(f"Unknown api_rule_attributes concept: {concept}")
+            if not isinstance(names, list) or not names or not all(isinstance(name, str) and name for name in names):
+                raise ValueError(f"api_rule_attributes.{rule_class}.{concept} must be a non-empty string array")
+            normalized[concept] = tuple(dict.fromkeys(names))
+        rule_attributes[_suffix(rule_class).casefold()] = normalized
+
     return RuleConfig(
         api_rule_classes=classes("api_rule_classes", DEFAULT_RULE_CONFIG.api_rule_classes),
         component_rule_classes=classes(
@@ -147,4 +189,5 @@ def load_rule_config(path: str | Path | None) -> RuleConfig:
             _suffix(key).casefold(): value.strip().upper()
             for key, value in methods.items()
         },
+        api_rule_attributes=rule_attributes,
     )

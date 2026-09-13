@@ -1,0 +1,25 @@
+{
+  "trace": {
+    "schema_version": 1,
+    "rules": [
+      {
+        "class": "my.company.AssignRule",
+        "kind": "set",
+        "attributes": {
+          "PropertyName": "DestinationPath",
+          "FromPropertyName": "SourcePath"
+        },
+        "defaults": {"FromType": "Data Item"}
+      },
+      {
+        "class": "my.company.CheckRule",
+        "kind": "evaluate",
+        "attributes": {"Expression": "Condition"},
+        "branch_attribute": "Outcome",
+        "branches": {"pass": true, "fail": false}
+      }
+    ]
+  },
+  "api_rule_classes": ["my.company.FetchRule"],
+  "method_by_rule_class_suffix": {"FetchRule": "GET"}
+}
