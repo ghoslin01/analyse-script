@@ -171,6 +171,15 @@ The JSON file extends, rather than replaces, the built-in vocabulary. Supported
 alias concepts are `source`, `method`, `path`, `base_url`, `filter`, `request`,
 `target`, `result`, `output`, and `selector`.
 
+Use `method_by_rule_class_suffix` to supply project-specific HTTP method defaults,
+for example `{"ReadRule": "GET", "CreateRule": "POST"}`. Matching uses the final
+class-name segment, ignoring case, and methods are normalized to uppercase.
+Explicit method attributes (including configured aliases) take priority, followed
+by attributes whose names end in `method`, then this mapping. There are no built-in
+class-to-method defaults. Declare API classes in `api_rule_classes` as well;
+the method mapping does not itself classify a Rule as an API. Mapping changes
+are included in the checkpoint configuration signature.
+
 The opt-in large-file test uses a generated caller IFP and validates the full
 SQLite build path with bounded memory:
 

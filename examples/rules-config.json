@@ -2,6 +2,9 @@
   "api_rule_classes": [
     "vendor.SpecialApiRule"
   ],
+  "method_by_rule_class_suffix": {
+    "SpecialApiRule": "GET"
+  },
   "component_rule_classes": [
     "vendor.SpecialComponentCallRule"
   ],

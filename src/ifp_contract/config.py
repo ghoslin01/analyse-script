@@ -49,6 +49,7 @@ class RuleConfig:
     aliases: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(DEFAULT_ALIASES)
     )
+    method_by_rule_class_suffix: dict[str, str] = field(default_factory=dict)
 
     @property
     def known_rule_classes(self) -> frozenset[str]:
@@ -56,6 +57,13 @@ class RuleConfig:
 
     def attribute_names(self, concept: str) -> tuple[str, ...]:
         return self.aliases.get(concept, ())
+
+    def method_for_rule_class(self, value: str | None) -> str | None:
+        candidate = _suffix(value or "").casefold()
+        for rule_class, method in self.method_by_rule_class_suffix.items():
+            if _suffix(rule_class).casefold() == candidate:
+                return method.strip().upper()
+        return None
 
     def is_api_rule(self, value: str | None) -> bool:
         return self._contains_class(self.api_rule_classes, value)
@@ -77,6 +85,9 @@ class RuleConfig:
             "component_rule_classes": sorted(self.component_rule_classes),
             "non_api_rule_classes": sorted(self.non_api_rule_classes),
             "aliases": {key: list(value) for key, value in sorted(self.aliases.items())},
+            "method_by_rule_class_suffix": dict(
+                sorted(self.method_by_rule_class_suffix.items())
+            ),
         }
 
 
@@ -113,6 +124,16 @@ def load_rule_config(path: str | Path | None) -> RuleConfig:
             raise ValueError(f"attribute_aliases.{concept} must be a JSON string array")
         aliases[concept] = tuple(dict.fromkeys(DEFAULT_ALIASES[concept] + tuple(values)))
 
+    methods = payload.get("method_by_rule_class_suffix", {})
+    if not isinstance(methods, dict):
+        raise ValueError("method_by_rule_class_suffix must be a JSON object")
+    for rule_class, method in methods.items():
+        if not _suffix(rule_class).strip() or not isinstance(method, str) or not method.strip():
+            raise ValueError(
+                "method_by_rule_class_suffix must map non-empty rule class names "
+                "to non-empty HTTP method strings"
+            )
+
     return RuleConfig(
         api_rule_classes=classes("api_rule_classes", DEFAULT_RULE_CONFIG.api_rule_classes),
         component_rule_classes=classes(
@@ -122,4 +143,8 @@ def load_rule_config(path: str | Path | None) -> RuleConfig:
             "non_api_rule_classes", DEFAULT_RULE_CONFIG.non_api_rule_classes
         ),
         aliases=aliases,
+        method_by_rule_class_suffix={
+            _suffix(key).casefold(): value.strip().upper()
+            for key, value in methods.items()
+        },
     )

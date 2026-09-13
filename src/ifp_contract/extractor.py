@@ -495,7 +495,8 @@ def scan_integrator(
                     "source_name": source_name,
                     "base_url": source_urls.get((source_name or "").casefold()),
                     "action": _value(attributes, *rule_config.attribute_names("method"))
-                    or _value_ending_with(attributes, "method"),
+                    or _value_ending_with(attributes, "method")
+                    or rule_config.method_for_rule_class(rule_class),
                     "api_path": _api_path(attributes, rule_config),
                     "filter_expr": _value(
                         attributes, *rule_config.attribute_names("filter")
