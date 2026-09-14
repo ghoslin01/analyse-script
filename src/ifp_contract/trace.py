@@ -554,6 +554,24 @@ class Trace:
         edge_keys, input_keys = set(), set()
         opaque_by_target: dict[str, set[str]] = {}
         writer_cache = {}
+        context_only = set()
+        expanded = set()
+
+        def retain(eid):
+            # Containment records location and activation, not a demand for
+            # every value read by the enclosing rule. Keep references closed
+            # without feeding these nodes back into the dependency queue.
+            pending = [eid]
+            while pending:
+                current = pending.pop()
+                if current in context_only:
+                    continue
+                context_only.add(current)
+                selected.add(current)
+                context = by_id[current]
+                pending.extend(context['parents'])
+                pending.extend(g['event'] for g in context['guards'])
+                pending.extend(context['loops'])
 
         def read_key(read):
             return tuple(sorted(read.items()))
@@ -571,13 +589,24 @@ class Trace:
                 inputs.append({'event': eid, 'field': read, 'status': status})
 
         for eid in (by_id if partial else seeds):
-            enqueue(eid)
+            seed = by_id[eid]
+            demand = None
+            if field and not partial:
+                path = field.removeprefix('!')
+                demand = {
+                    'scope': seed['entry'] + ':session' if field.startswith('!') else seed['scope'],
+                    'path': path,
+                    'group': any(w.get('group') and shape(w['path']) == shape(path)
+                                 for w in seed['writes']),
+                }
+            enqueue(eid, demand)
         while queue:
             eid, demand = queue.popleft()
             selected.add(eid)
+            expanded.add(eid)
             ev = by_id[eid]
             for parent in ev['parents']:
-                enqueue(parent)
+                retain(parent)
             for guard in ev['guards']:
                 enqueue(guard['event'])
             for loop in ev['loops']:
@@ -634,11 +663,12 @@ class Trace:
                 if prior['sequence'] >= ev['sequence']:
                     break
                 if index.compatible(prior, ev):
-                    enqueue(prior['id'])
+                    retain(prior['id'])
                     opaque_by_target.setdefault(eid, set()).add(prior['id'])
         if not seeds:
             self.issue('ANCHOR_NOT_FOUND', field=field)
-        events = [e for e in self.events if e['id'] in selected]
+        events = [{**e, 'slice_role': 'dependency' if e['id'] in expanded else 'context_or_boundary'}
+                  for e in self.events if e['id'] in selected]
         node_keys = {e['node'] for e in events}
         issues = [i for i in self.issues if not i.get('event') or i['event'] in selected]
         scenario = None
@@ -648,7 +678,9 @@ class Trace:
                         'classifications': [c for c in self.scenario['classifications'] if c['event'] in selected]}
         coverage = {'files_read': len(self.sources), 'contexts_examined': len(self.events),
                     'contexts_exported': len(events), 'limited': self.limited,
-                    'partial_scope_only': partial, 'runtime_verified': False}
+                    'partial_scope_only': partial, 'runtime_verified': False,
+                    'dependency_contexts': len(expanded),
+                    'context_or_boundary_contexts': len(selected - expanded)}
         # The slicer considers opaque predecessors for every field demand.  Keep
         # only those that reach an anchor through its final evidence closure;
         # this avoids exporting a quadratic internal work list.
@@ -663,6 +695,10 @@ class Trace:
         conclusions = assess_conclusions(events, edges, inputs, issues, seeds, coverage,
                                          opaque_dependencies, scenario)
         return {'schema_version': 1, 'analysis': 'static_candidates', 'seeds': seeds,
+                'slice_policy': {'containment': 'context_only',
+                                 'possible_opaque_effect': 'boundary_only',
+                                 'explicit_dependencies': 'follow_reads_guards_loops',
+                                 'anchor_field': field},
                 'configuration': {'trace_semantics_sha256': self.semantics.signature,
                                   'api_rules': self.config.signature_payload()},
                 'scenario': scenario,

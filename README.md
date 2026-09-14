@@ -479,6 +479,31 @@ from the same command/request; there is no trace checkpoint database.
 
 ### Trace summaries and performance
 
+Backward slicing follows explicit reads, execution guards and loop dependencies.
+Enclosing rules are retained as context; their unrelated inputs are not traced
+just because they contain a relevant rule. Earlier unknown rules and phase
+transitions are retained as possible-influence boundaries without recursively
+expanding their own dependencies. An unknown rule that explicitly writes a
+demanded field, or is selected with `--rule-eid`, still has its declared inputs
+traced. Unknown effects remain blockers in the conclusion assessment.
+
+A field anchor carries its exact field and array instance through group
+mappings. Asking for `Target[1].Currency` therefore differs from asking for the
+whole `Target[1]` group. Every event records `slice_role`: `dependency` means its
+dependencies were followed; `context_or_boundary` means its source evidence was
+retained without that expansion. `slice_policy` documents these traversal rules,
+and coverage counts both roles separately. This narrows the slice without a
+report-line cutoff. Real conditions, loops and alternative UI-event writers can
+still introduce multiple relevant branches.
+
+`report.md` shows dependency details, lists context/boundary events in a separate
+index, and uses guard references with a shared catalog of conditions. The JSON
+retains the collected attributes, scope, guards and source locations of all
+selected events. To investigate a boundary's own inputs, run a separate trace
+using its source file, source rule `eid` and entry. A broad rule anchor includes
+its descendants and can intentionally produce a much larger slice than one
+field anchor.
+
 `trace` follows references from the selected entry; it does not enumerate the
 entire project. A 4 GB root therefore does not imply reading 4 GB for each
 question. Work and memory still grow with the reachable files, expanded rule

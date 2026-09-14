@@ -235,6 +235,7 @@ def markdown(data: dict) -> str:
     nodes = data['nodes']
     all_events = data['events']
     events = {e['id']: e for e in all_events}
+    has_slice_roles = any('slice_role' in event for event in all_events)
     api_events = [event for event in all_events if event.get('api')]
     incoming_edges = defaultdict(list)
     for edge in data['edges']:
@@ -275,8 +276,21 @@ def markdown(data: dict) -> str:
     for ev in api_events:
         lines.append(f"- {ev['id']}: `{ev['api']['method']} {ev['api']['path']}` (conditional candidate, not a runtime call log)")
     lines += ['', '## Trace', '']
+    context_events = []
+    guard_catalog = set()
     for ev in all_events:
         node = nodes[ev['node']]
+        if has_slice_roles:
+            for guard in ev.get('guards', ()):
+                parent = events.get(guard.get('event'), {})
+                parent_node = nodes.get(parent.get('node'), {})
+                attributes = parent.get('semantics', {}).get('attributes', parent_node.get('attributes', {}))
+                expression = guard.get('expression') or attributes.get('Expression') or parent.get('name', guard.get('event', ''))
+                kind = guard.get('kind') or parent.get('kind', 'unknown')
+                guard_catalog.add((guard.get('event', ''), str(guard.get('branch', '')), expression, kind))
+        if has_slice_roles and ev.get('slice_role') == 'context_or_boundary':
+            context_events.append(ev)
+            continue
         label = node['attributes'].get('QuestionText') or node['attributes'].get('ActionCommand') or ev['name']
         lines += [f"### {ev['id']} · {ev['kind']} · {label}", '',
                   f"Source: `{node['file']}:{node['line']}` · byte `{node['offset']}` · eid `{node['eid']}`",
@@ -309,10 +323,14 @@ def markdown(data: dict) -> str:
             lines += ['Expression:', '', '```text', expr, '```', '']
         if ev['guards']:
             lines += ['Execution prerequisites (retained separately from source-value prerequisites):', '']
-            for g in ev['guards']:
-                parent = events.get(g['event'], {})
-                label = g.get('expression') or parent.get('name', g['event'])
-                lines.append(f"- {g['event']}: `{g['branch']}` branch of {g['kind']} `{label}`")
+            if has_slice_roles:
+                refs = ', '.join(f"{g['event']}:{g['branch']}" for g in ev['guards'])
+                lines.append(f'- Guard references: `{refs}`')
+            else:
+                for g in ev['guards']:
+                    parent = events.get(g['event'], {})
+                    label = g.get('expression') or parent.get('name', g['event'])
+                    lines.append(f"- {g['event']}: `{g['branch']}` branch of {g['kind']} `{label}`")
             lines.append('')
         if ev['loops']:
             lines += ['Symbolic loops: ' + ', '.join(ev['loops']), '']
@@ -325,6 +343,20 @@ def markdown(data: dict) -> str:
                     suffix += '; order between UI events unknown'
                 lines.append(f"- {edge['from']} → {edge['to']}: `{edge['field']['path']}` ({edge['relation']}{suffix})")
             lines.append('')
+    if context_events:
+        lines += ['## Context and boundary index', '',
+                  'These events are retained for location or possible unknown influence. '
+                  'Their inputs were not recursively traced; full attributes and guards remain in evidence.json.', '']
+        for ev in context_events:
+            node = nodes[ev['node']]
+            name = f" · {ev['name']}" if ev.get('name') else ''
+            lines.append(f"- `{ev['id']}` · `{ev.get('kind', 'unknown')}` · `{node.get('file', '?')}:{node.get('line', '?')}`{name}")
+    if guard_catalog:
+        lines += ['', '## Guard catalog', '',
+                  'Each `(event, branch, expression, kind)` tuple is listed once. '
+                  'Guards of context-only events are retained configuration, not proven execution.', '']
+        for event_id, branch, expression, kind in sorted(guard_catalog):
+            lines.append(f"- `{event_id}:{branch}` · `{kind}` · `{expression}`")
     lines += ['## Boundaries and diagnostics', '',
               'External inputs and conditional writes below are not proof of a missing value or a defect.', '']
     for item in data['inputs']:

@@ -1,4 +1,4 @@
-from ifp_contract.trace_report import logic_summary
+from ifp_contract.trace_report import logic_summary, markdown
 
 
 def test_long_chain_omits_a_gap_without_mislabeling_edges():
@@ -126,3 +126,75 @@ def test_api_request_dependencies_are_not_direct_value_sources():
     summary = logic_summary(data)
     assert '共 1 个 API 候选；其中 1 个沿目标数据依赖边可达' in summary
     assert '请求参数（copy.ifp' not in summary
+
+
+def test_markdown_indexes_context_events_and_deduplicates_context_guards():
+    data = bundle()
+    data['coverage'] = {'files_read': 3, 'limited': False}
+    for node in data['nodes'].values():
+        node.update(attributes={}, offset=0, eid=node['file'])
+    for event in data['events']:
+        event.update(entry='P.Input', scope='root', loops=[], triggers=[])
+    data['events'][0]['slice_role'] = 'dependency'
+    data['events'][1]['slice_role'] = 'dependency'
+    data['events'][2]['slice_role'] = 'dependency'
+    context = {
+        'id': 'context', 'name': '未知规则上下文', 'kind': 'unknown', 'node': 'copy',
+        'writes': [], 'reads': [{'path': 'Unrelated.Value', 'scope': 'root', 'group': False}],
+        'guards': [{'event': 'cond', 'branch': 'True', 'kind': 'condition',
+                    'expression': "$$Flag$ == 'Y'"}], 'loops': [], 'parents': [],
+        'triggers': [], 'entry': 'P.Input', 'scope': 'root',
+        'slice_role': 'context_or_boundary',
+    }
+    condition = {
+        'id': 'cond', 'name': '判断条件', 'kind': 'evaluate', 'node': 'copy',
+        'writes': [], 'reads': [], 'guards': [], 'loops': [], 'parents': [],
+        'triggers': [], 'entry': 'P.Input', 'scope': 'root',
+        'slice_role': 'context_or_boundary',
+    }
+    data['events'].extend([context, condition])
+    data['edges'].append({'from': 'context', 'to': 'target', 'field': {'path': 'Currency'},
+                          'relation': 'opaque_rule_may_affect_anchor', 'conditional': True})
+    data['nodes']['copy']['attributes'] = {'Expression': "$$Flag$ == 'Y'"}
+
+    text = markdown(data)
+
+    assert '## Context and boundary index' in text
+    assert 'These events are retained for location or possible unknown influence.' in text
+    assert 'Their inputs were not recursively traced; full attributes and guards remain in evidence.json.' in text
+    assert '- `context` · `unknown` · `copy.ifp:20` · 未知规则上下文' in text
+    assert '### context ·' not in text
+    assert 'Unrelated.Value' not in text
+    assert text.count("`cond:True` · `condition` · `$$Flag$ == 'Y'`") == 1
+    assert '`context`' in text
+    assert '`True` branch' not in text
+    assert 'Guard references:' in text or 'cond:True' in text
+
+
+def test_markdown_dependency_guards_are_references_and_context_catalog_keeps_branches():
+    data = bundle()
+    data['coverage'] = {'files_read': 3, 'limited': False}
+    for node in data['nodes'].values():
+        node.update(attributes={}, offset=0, eid=node['file'])
+    for event in data['events']:
+        event.update(entry='P.Input', scope='root', loops=[], triggers=[])
+        event['slice_role'] = 'dependency'
+    data['events'][1]['guards'] = [
+        {'event': 'cond', 'branch': 'True', 'kind': 'condition', 'expression': 'TRUE'},
+        {'event': 'cond', 'branch': 'False', 'kind': 'condition', 'expression': 'FALSE'},
+    ]
+    data['events'].append({
+        'id': 'context', 'name': '边界', 'kind': 'unknown', 'node': 'copy',
+        'writes': [], 'reads': [], 'guards': [
+            {'event': 'cond', 'branch': 'True', 'kind': 'condition', 'expression': 'X'},
+            {'event': 'cond', 'branch': 'False', 'kind': 'condition', 'expression': 'X'},
+        ], 'loops': [], 'parents': [], 'triggers': [], 'entry': 'P.Input',
+        'scope': 'root', 'slice_role': 'context_or_boundary',
+    })
+    text = markdown(data)
+
+    assert 'Guard references: `cond:True, cond:False`' in text
+    assert text.count('`cond:True` · `condition` · `X`') == 1
+    assert text.count('`cond:False` · `condition` · `X`') == 1
+    assert '`cond:True` · `condition` · `TRUE`' in text
+    assert '`cond:False` · `condition` · `FALSE`' in text
