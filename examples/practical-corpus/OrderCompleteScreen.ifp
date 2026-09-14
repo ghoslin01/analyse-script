@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project Name="Order Complete Screen" eid="SCREEN-ORDER">
+  <Rules>
+    <Rule Name="Place order" eid="CALL-ORDER"
+      RuleClassName="com.acquire.intelligentforms.rules.CallComponentRule"
+      RuleType="PostPhase"
+      SelectComponent="Integration\BankingDataIntegrator.ifp"
+      ComponentList="PlaceOrder"
+      Amount_ClassType="com.acquire.intelligentforms.entities.component.ComponentMapping"
+      Amount_SolutionDataItemMapping="Screen[1].Payment[1].Amount"
+      Amount_PropertyKey="PlaceOrder[1].Request[1].Amount"
+      Amount_In="Y"
+      Confirmation_ClassType="com.acquire.intelligentforms.entities.component.ComponentMapping"
+      Confirmation_SolutionDataItemMapping="Screen[1].Result[1].ConfirmationId"
+      Confirmation_PropertyKey="PlaceOrder[1].Response[1].ConfirmationId"
+      Confirmation_Out="Y" />
+  </Rules>
+</Project>

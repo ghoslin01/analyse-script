@@ -8,6 +8,7 @@ from pathlib import Path
 from time import perf_counter
 
 from .trace import Trace
+from .trace_source import TraceSource
 from .templates import template_markdown
 
 
@@ -25,8 +26,27 @@ def _source_chains(data: dict, limit: int = 12):
     events = {e['id']: e for e in data.get('events', [])}
     incoming = defaultdict(list)
     for edge in data.get('edges', []):
-        incoming[edge['to']].append(edge)
-    queue = deque(seed for seed in data.get('seeds', []) if seed in events)
+        if edge.get('dependency_role') != 'control':
+            incoming[edge['to']].append(edge)
+    roots = [seed for seed in data.get('seeds', []) if seed in events]
+    displays = [seed for seed in roots if events[seed].get('display_field')]
+    if displays:
+        # A writer may itself be an anchor. Do not let that shorter starting
+        # point hide the display -> writer -> API path. Keep other anchors
+        # when they are not reachable from any displayed value.
+        covered = set(displays)
+        pending = deque(displays)
+        while pending:
+            current = pending.popleft()
+            if events[current].get('api'):
+                continue
+            for edge in incoming.get(current, ()):
+                source = edge['from']
+                if source in events and source not in covered:
+                    covered.add(source)
+                    pending.append(source)
+        roots = displays + [seed for seed in roots if seed not in covered]
+    queue = deque(roots)
     visited = set(queue)
     predecessor = {}
     while queue:
@@ -82,6 +102,8 @@ def _format_chain(path, edges, events, nodes, conditions=None, depth_limit: int 
         eid = path[index]
         event = events[eid]
         label = event.get('name') or eid
+        if event.get('display_field'):
+            label = nodes.get(event.get('node'), {}).get('attributes', {}).get('QuestionText') or label
         if event.get('api'):
             api = event['api']
             label = f"{api.get('method', '?')} {api.get('path', '?')}"
@@ -144,8 +166,9 @@ def logic_summary(data: dict) -> str:
     if len(reachable_api_ids) > 12:
         lines.append(f'- 已展示 {len(chains)} 条来源链，其余见 report.md。')
     if not chains:
-        lines.append('未从锚点沿数据依赖边找到 API 来源；请结合下方赋值证据和 report.md 检查。')
-    lines += ['', '## 目标的写入路径或规则', '']
+        lines.append('未从锚点沿数据依赖边找到 API 来源；请结合下方赋值证据和 report.md 检查。'
+                     '这不排除尚未解析的上游值间接来自 API。')
+    lines += ['', '## 目标的显示节点、写入路径或规则', '']
     labels = {'excluded': '此场景下排除', 'candidate': '有前提的候选路径', 'other_event_context': '其他事件的证据，先后未确定'}
     conditions = {c['event']: c for c in scenario['conditions']} if scenario else {}
     for eid in data['seeds'][:20]:
@@ -153,6 +176,13 @@ def logic_summary(data: dict) -> str:
         node = data['nodes'][e['node']]
         state = labels.get(e.get('scenario', {}).get('status'), '候选路径')
         lines.append(f"- **{e['name']}（{state}）**：`{node['file']}:{node['line']}`，事件 `{eid}`。")
+        if e.get('display_field'):
+            label = node['attributes'].get('QuestionText') or e['name']
+            lines.append(f"  - 只读显示：{label}，字段 `{e['display_field']['path']}`；源 eid `{node.get('eid')}`。")
+        if e.get('ui_condition'):
+            condition = e['ui_condition']
+            lines.append(f"  - 显示条件配置：`{condition['expression']}`；NotApplicable=`{condition.get('not_applicable')}`。"
+                         '保留原始配置，不推断显示/隐藏结果。')
         if e['writes']:
             lines.append('  - 写入：' + '、'.join(f"`{r['path']}`" for r in e['writes']) + '。')
         if e['reads']:
@@ -253,6 +283,9 @@ def markdown(data: dict) -> str:
             lines.append(f"  - Reads `{read['path']}`")
         for written in ev['writes']:
             lines.append(f"  - Writes `{written['path']}`")
+        if ev.get('display_field'):
+            label = node['attributes'].get('QuestionText') or ev['name']
+            lines.append(f"  - Read-only display: {label}; source eid `{node.get('eid')}`; no field write.")
         for guard in ev['guards']:
             if guard['kind'] == 'condition':
                 lines.append(f"  - {guard['branch']} branch: `{guard['expression']}`")
@@ -309,10 +342,11 @@ def markdown(data: dict) -> str:
         if ev.get('scenario'):
             lines += [f"Scenario: **{ev['scenario']['status']}**; excluded by {ev['scenario']['excluded_by']}", '']
         if ev.get('triggers'):
-            lines += ['UI event context: ' + ', '.join(ev['triggers']) + '. Order between separate UI events is unknown.', '']
+            lines += ['Activation context: ' + ', '.join(ev['triggers']) + '. Order between separate activations is unknown.', '']
         if ev.get('ui_condition'):
             lines += ['UI condition configuration (activation semantics not inferred):', '',
-                      '```text', ev['ui_condition']['expression'], '```', '']
+                      '```text', ev['ui_condition']['expression'], '```',
+                      f"NotApplicable: `{ev['ui_condition'].get('not_applicable')}`; visibility is not evaluated.", '']
         for key, label in [('reads', 'Reads'), ('writes', 'Writes')]:
             if ev[key]:
                 lines.append(label + ': ' + ', '.join(f"`{r['path']}` ({r['scope']})" for r in ev[key]))
@@ -341,6 +375,10 @@ def markdown(data: dict) -> str:
                 suffix = '; conditional write — prior value may remain' if edge['conditional'] else ''
                 if edge.get('event_order') == 'unknown_between_ui_events':
                     suffix += '; order between UI events unknown'
+                elif edge.get('event_order') == 'unknown_product_scheduling':
+                    suffix += '; product rule scheduling relative to phase is unknown'
+                if edge.get('dependency_role') == 'control':
+                    suffix += '; UI condition dependency, not display value source'
                 lines.append(f"- {edge['from']} → {edge['to']}: `{edge['field']['path']}` ({edge['relation']}{suffix})")
             lines.append('')
     if context_events:
@@ -373,6 +411,58 @@ def markdown(data: dict) -> str:
     return '\n'.join(lines)
 
 
+def _eid_target(root: Path, eid: str, file: Path | None, entry: str | None,
+                cache_dir: Path | None) -> dict:
+    from .trace_locator import candidate_files
+
+    root = root.resolve()
+    if not root.is_dir():
+        raise ValueError(f'Trace root is not a directory: {root}')
+    if not eid.strip():
+        raise ValueError('--eid must not be empty')
+    candidates = [root / str(file).replace('\\', '/')] if file else candidate_files(root, eid, cache_dir)
+    matches = []
+    for path in candidates:
+        path = path.resolve()
+        if not path.is_relative_to(root):
+            raise ValueError(f'Starting IFP is outside ROOT: {path}')
+        source = TraceSource(root, path, cache_dir=cache_dir)
+        allowed = source.entry_roots(entry) if entry else None
+        for node in source.eids.get(eid, []):
+            ancestors = []
+            current = node
+            while current is not None:
+                ancestors.append(current)
+                current = current.parent
+            if allowed is not None and not any(a is r for a in ancestors for r in allowed):
+                continue
+            if node.tag not in {'Question', 'Button', 'Rule'}:
+                raise ValueError(f'--eid selects a {node.tag}; expected a Question, Button or Rule')
+            phase = next((a for a in ancestors if a.tag == 'Phase'), None)
+            resolved_entry = entry
+            if resolved_entry is None:
+                if phase is not None:
+                    resolved_entry = ('@' + phase.meta['eid'] if phase.meta.get('eid')
+                                      else source.phase_name(phase))
+                else:
+                    # Keep enclosing branch rules when a shared rule is selected.
+                    outer_rule = next((a for a in reversed(ancestors) if a.tag == 'Rule'), node)
+                    if outer_rule.meta.get('eid'):
+                        resolved_entry = '@' + outer_rule.meta['eid']
+                    else:
+                        raise ValueError(f'Cannot infer an entry for eid {eid!r} in {source.relative}; supply --entry')
+            matches.append((source.relative, node.line, resolved_entry))
+        source.save_cache()
+    if not matches:
+        raise ValueError(f'EID_NOT_FOUND: {eid!r} in the selected files/entry')
+    if len(matches) != 1:
+        locations = ', '.join(f'{name}:{line}' for name, line, _ in matches[:20])
+        raise ValueError(f'EID_NOT_UNIQUE: {eid!r} matches {len(matches)} nodes: {locations}; '
+                         'use --file (and --entry if needed) to select one')
+    name, _, resolved_entry = matches[0]
+    return {'file': name, 'field': None, 'rule_eid': eid, 'entry': resolved_entry}
+
+
 def run_trace(args) -> int:
     started = perf_counter()
     request = {}
@@ -393,20 +483,25 @@ def run_trace(args) -> int:
         variables[name] = value
     targets = request.get('targets', [])
     scenario = json.loads(args.scenario.read_text(encoding='utf-8')) if args.scenario else None
-    if args.file:
+    cache_dir = None if getattr(args, 'no_cache', False) else (
+        getattr(args, 'cache_dir', None) or
+        Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'ifp-contract' / 'trace')
+    discovery_seconds = 0.0
+    if getattr(args, 'eid', None) is not None:
+        locating = perf_counter()
+        targets = [_eid_target(args.root, args.eid, args.file, args.entry, cache_dir)]
+        discovery_seconds = perf_counter() - locating
+    elif args.file:
         targets = [{'file': str(args.file), 'field': args.field, 'rule_eid': args.rule_eid, 'entry': args.entry}]
     if (not isinstance(targets, list) or not targets or
         any(not isinstance(t, dict) or not isinstance(t.get('file'), str) or not t['file'] or
             bool(t.get('field')) == bool(t.get('rule_eid')) or
             any(t.get(k) is not None and not isinstance(t[k], str) for k in ('field', 'rule_eid', 'entry')) for t in targets)):
-        raise ValueError('Supply --file and exactly one of --field/--rule-eid, or a request with valid targets')
+        raise ValueError('Supply --eid, --file with one of --field/--rule-eid, or a request with valid targets')
     max_files = args.max_files if args.max_files is not None else request.get('max_files', 50)
     max_contexts = args.max_contexts if args.max_contexts is not None else request.get('max_contexts', 5000)
     bundles = []
     measurements = []
-    cache_dir = None if getattr(args, 'no_cache', False) else (
-        getattr(args, 'cache_dir', None) or
-        Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'ifp-contract' / 'trace')
     failed = False
     # Each target gets independent contexts; never merge branches from separate anchors.
     for target in targets:
@@ -425,6 +520,17 @@ def run_trace(args) -> int:
         bundles.append(data)
         measurements.append({'target': target, **trace.performance})
         failed |= trace.failed
+    if args.output is None:
+        base = Path.cwd() / 'trace-output'
+        suffix = 1
+        while True:
+            output = base if suffix == 1 else base.with_name(f'{base.name}-{suffix}')
+            try:
+                output.mkdir()
+                args.output = output
+                break
+            except FileExistsError:
+                suffix += 1
     if args.root.resolve() == args.output.resolve():
         raise ValueError('Trace output must differ from the IFP root')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -444,6 +550,7 @@ def run_trace(args) -> int:
     (args.output / 'report.md').write_text('\n\n---\n\n'.join(markdown(b) for b in bundles), encoding='utf-8')
     (args.output / 'summary.md').write_text('\n\n---\n\n'.join(logic_summary(b) for b in bundles), encoding='utf-8')
     performance = {'schema_version': 1, 'targets': measurements,
+                   'discovery_seconds': discovery_seconds,
                    'export_seconds': perf_counter() - exporting,
                    'total_seconds': perf_counter() - started,
                    'cache_enabled': cache_dir is not None}

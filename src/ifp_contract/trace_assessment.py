@@ -72,7 +72,8 @@ def _value_closure(seed: str, by_id: dict[str, dict], incoming: dict[str, list[d
         closure.add(current)
         if by_id[current].get('api'):
             continue
-        queue.extend(edge['from'] for edge in incoming[current])
+        queue.extend(edge['from'] for edge in incoming[current]
+                     if edge.get('dependency_role') != 'control')
     return closure
 
 
@@ -134,6 +135,8 @@ def assess_conclusions(events: list[dict], edges: list[dict], inputs: list[dict]
             event = by_id[event_id]
             if event.get('kind') == 'unknown':
                 blockers['UNKNOWN_RULE_SEMANTICS'].append(event_id)
+            if event.get('kind') == 'product_rules':
+                blockers['PRODUCT_RULE_SCHEDULING_UNKNOWN'].append(event_id)
             if event.get('semantics', {}).get('incomplete'):
                 blockers['INCOMPLETE_RULE_EVIDENCE'].append(event_id)
             for item in input_by_event[event_id]:

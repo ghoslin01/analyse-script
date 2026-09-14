@@ -15,7 +15,7 @@ from .extractor import mappings_from_attributes, _value, rule_base_url
 from .trace_source import TraceNode, TraceSource
 from .trace_config import TraceConfig, STANDARD_KINDS, ATTRIBUTES
 from .trace_index import TraceIndex
-from .behavior import effective_disabled, selector_value
+from .behavior import effective_disabled, selector_value, parse_bool
 from .trace_partial import partial_rule_evidence
 from .trace_assessment import assess_conclusions, evidence_closures
 from .templates import condition_references, field_references, template_evidence
@@ -182,8 +182,8 @@ class Trace:
                 'entry': self.current_entry, 'scope': scope, 'kind': kind,
                 'name': node.meta.get('Name', node.tag), 'guards': list(guards), 'loops': list(loops),
                 'parents': list(parents), 'reads': reads or [], 'writes': writes or [], **details}
-        item['triggers'] = [p for p in parents if self.events[int(p[1:])]['kind'] in {'ui_event', 'ui_input'}]
-        if kind in {'ui_event', 'ui_input'}:
+        item['triggers'] = [p for p in parents if self.events[int(p[1:])]['kind'] in {'ui_event', 'ui_input', 'product_rules'}]
+        if kind in {'ui_event', 'ui_input', 'product_rules'}:
             item['triggers'].append(item['id'])
         self.events.append(item)
         return item
@@ -214,7 +214,7 @@ class Trace:
         if node.tag in {'Question', 'Button'}:
             kind = 'ui_event'
             if (node.tag == 'Question' and a.get('PropertyKey') and
-                not any(a.get(k, '').casefold() in {'y', 'true'} for k in ('ReadOnly', 'DisableInput'))):
+                not any(parse_bool(a.get(k)) for k in ('ReadOnly', 'DisableInput'))):
                 kind = 'ui_input'
         if effective_disabled(node, source.attributes, self.semantics.resolve,
                               self.semantics.normalize, self.disabled_cache):
@@ -258,10 +258,15 @@ class Trace:
             ev['ui_condition'] = {'expression': a['ConditionExpression'],
                                   'not_applicable': a.get('NotApplicable'),
                                   'status': 'configuration_only_not_a_proven_execution_gate'}
-            add_reads(a['ConditionExpression'])
+            ev['ui_condition_fields'] = [self.field(scope, p, p.endswith(']'))
+                                         for p in condition_references(a['ConditionExpression'])]
         if kind == 'ui_input':
             ev['writes'].append(self.field(scope, a['PropertyKey']))
             ev['value_origin'] = 'user_or_existing_ui_value'
+        elif node.tag == 'Question' and a.get('PropertyKey'):
+            ev['display_field'] = self.field(scope, a['PropertyKey'])
+            ev['reads'].append(ev['display_field'])
+            ev['value_origin'] = 'displayed_existing_value'
         if kind in {'evaluate', 'expression'}:
             if kind == 'evaluate':
                 add_condition_reads(a.get('Expression', ''))
@@ -460,7 +465,7 @@ class Trace:
                 if len(phases) != 1:
                     self.issue('INITIAL_PHASE_NOT_UNIQUE', event=ev['id'], initial=initial)
                 else:
-                    self.walk(target, phases[0], callee_scope, guards, loops, parents, active)
+                    self.walk_entry(target, phases[0], callee_scope, guards, loops, parents, active)
             for mapping in mappings:
                 raw = mapping['attributes']
                 # PubIn/Out declares a capability. Only In/Out enables a call-site edge.
@@ -480,6 +485,22 @@ class Trace:
                            writes=[remote_ref if incoming else local_ref], mapping=raw,
                            mapping_prefix=mapping['mapping_prefix'])
 
+    def walk_entry(self, source, root, scope, guards, loops, parents, active=()):
+        # Product-level rules are candidates available to this phase, but their
+        # scheduling relative to phase/UI rules is not established by nesting.
+        # Give them a separate activation so they cannot become definite writes
+        # merely because collection visits them first. Sibling phases stay out.
+        product = root.parent if root.tag == 'Phase' else None
+        if product is not None and product.tag == 'Product':
+            rules = [node for node in product.children if node.tag == 'Rule']
+            if rules:
+                context = self.event(source, product, scope, 'product_rules', guards, loops, parents,
+                                     scheduling='unknown_relative_to_phase')
+                if context is not None:
+                    for rule in rules:
+                        self.walk(source, rule, scope, guards, loops, [*parents, context['id']], active)
+        self.walk(source, root, scope, guards, loops, parents, active)
+
     def collect(self, file: str, field: str | None, rule_eid: str | None, entry: str | None,
                 scenario: dict | None = None):
         started = perf_counter()
@@ -497,7 +518,7 @@ class Trace:
             start = len(self.events)
             scope = self.current_entry + ':root'
             try:
-                self.walk(source, root, scope, [], [], [])
+                self.walk_entry(source, root, scope, [], [], [])
             except (OSError, ValueError) as error:
                 self.failed = True
                 self.issue('COLLECTION_ERROR', entry=self.current_entry, message=str(error))
@@ -505,6 +526,8 @@ class Trace:
                 if rule_eid and self.nodes[ev['node']]['file'] == source.relative and self.nodes[ev['node']]['eid'] == rule_eid:
                     seeds.append(ev['id'])
                 elif field and any(overlaps(w, self.field(scope, field)) for w in ev['writes']):
+                    seeds.append(ev['id'])
+                elif field and ev.get('display_field') and overlaps(ev['display_field'], self.field(scope, field)):
                     seeds.append(ev['id'])
             if rule_eid:
                 anchored = set(seeds)
@@ -624,7 +647,9 @@ class Trace:
             if demand and (ev['kind'] in {'input_mapping', 'output_mapping'} or
                            (ev['kind'] == 'set' and any(w.get('group') for w in ev['writes']))):
                 reads = [project_read(r, w, demand) for r in reads for w in ev['writes'] if overlaps(w, demand)]
-            for read in reads:
+            demands = [(read, 'value') for read in reads]
+            demands.extend((read, 'control') for read in ev.get('ui_condition_fields', ()))
+            for read, dependency_role in demands:
                 key = (eid, read_key(read))
                 writers = writer_cache.get(key)
                 if writers is None:
@@ -649,8 +674,14 @@ class Trace:
                                   'relation': 'candidate_definition' if len(writers) > 1 or writer['triggers'] != ev['triggers'] else 'definition',
                                   'event_order': 'unknown_between_ui_events' if writer['triggers'] != ev['triggers'] else 'configuration_order',
                                   'conditional': writer['triggers'] != ev['triggers'] or any(g not in ev['guards'] for g in writer['guards'])}
+                    if dependency_role == 'control':
+                        edge['dependency_role'] = 'control'
+                    if (writer['triggers'] != ev['triggers'] and
+                        any(by_id[t]['kind'] == 'product_rules'
+                            for t in writer['triggers'] + ev['triggers'] if t in by_id)):
+                        edge['event_order'] = 'unknown_product_scheduling'
                     edge_key = (writer['id'], eid, read_key(read), edge['relation'],
-                                edge['event_order'], edge['conditional'])
+                                edge['event_order'], edge['conditional'], dependency_role)
                     if edge_key not in edge_keys:
                         edge_keys.add(edge_key)
                         edges.append(edge)

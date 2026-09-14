@@ -118,9 +118,57 @@ shared Rule references. It does not require `build` or a SQLite database.
 
 ### Trace quick start
 
+If you have a Question's eid, supply just the component root and that eid:
+
+```bash
+ifp-contract trace COMPONENT_ROOT --eid display-label-001
+```
+
+The command locates the node's file and enclosing phase, then traces that node.
+For a read-only Question, it follows the displayed field's candidate writers.
+An editable Question remains an input source. Rule and Button eids also work.
+Reports go to `./trace-output`; if it exists, a new numbered directory is used.
+Library path variables still need an explicit value when the project uses them:
+
+```bash
+ifp-contract trace COMPONENT_ROOT --eid display-label-001 --path-var LIBRARY_HOME=Library
+```
+
+Here `Library` is a directory beneath `COMPONENT_ROOT`; `LIBRARY_HOME` must match
+the variable used by the component selectors. Existing `--path-var NAME=PATH`
+options can be repeated for additional variables.
+
+File discovery automatically caches eid candidates and updates changed, added
+and deleted IFP files. The first lookup reads the project's IFP files; later
+lookups check file metadata and scan changed files. Candidate matches are
+verified against parsed XML before tracing. This lookup does not expand the
+project's dependency graph. Duplicate eids produce a list of locations; use
+`--file` to select the intended file. `--file` also skips project-wide discovery
+when you already know the location. `--no-cache` forces discovery to rescan.
+
 Use `--field` to find the candidate definitions of a data item, or `--rule-eid`
 to inspect one rule and the execution evidence beneath it. Exactly one anchor is
 required unless the same information comes from `--request`.
+
+A field anchor also matches a read-only Question's `PropertyKey`. Such a
+Question reads the displayed value and appears in the report with its
+`QuestionText` and source `eid`; it does not write the field. When no writer is
+reachable, the display anchor remains and the value is marked unresolved.
+Editable Questions retain their input-write behavior.
+
+`ConditionExpression` and `NotApplicable` remain raw visibility configuration.
+Their field dependencies are recorded separately in `ui_condition_fields`, with
+`dependency_role: control` on edges, so an API supplying a display condition is
+not reported as the displayed value's direct API source. Visibility itself is
+not evaluated.
+
+For a phase entry, direct rules of the enclosing Product are collected as
+candidates in a separate activation, without collecting sibling phases. Their
+scheduling relative to the phase is unknown: corresponding edges are conditional
+and labeled `unknown_product_scheduling`, and conclusions retain a
+`PRODUCT_RULE_SCHEDULING_UNKNOWN` boundary. Collection order does not establish
+that product rules ran before the display. An isolated `--entry @eid` still
+collects only that rule and its dependencies.
 
 ```bash
 ifp-contract trace COMPONENT_ROOT \
@@ -141,6 +189,7 @@ The important options are:
 | Option | Meaning |
 | --- | --- |
 | `ROOT` | Component root. Every followed IFP must remain under this directory. |
+| `--eid` | Question, Button or Rule eid; automatically locate its file and entry. Use instead of `--field`/`--rule-eid`. |
 | `--file` | Starting IFP, relative to `ROOT`. |
 | `--field` | Data item or group to trace backwards. |
 | `--rule-eid` | Rule anchor; use instead of `--field`. |
@@ -152,7 +201,7 @@ The important options are:
 | `--cache-dir DIR` | Reuse content-verified source parsing data in `DIR`. |
 | `--no-cache` | Disable source-cache reuse for this run. |
 | `--strict` | Return status 2 when unresolved inputs or diagnostics remain. |
-| `--output` | New evidence directory; it must differ from `ROOT`. |
+| `--output` | Evidence directory; defaults to `./trace-output` or a new numbered directory. It must differ from `ROOT`. |
 
 ### Scan the local Saba_corp Amount chain
 

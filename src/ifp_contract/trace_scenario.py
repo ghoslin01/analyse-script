@@ -152,7 +152,7 @@ class Scenario:
             if len(matches) != 1:
                 raise ValueError('scenario.trigger_eid must identify one reached Question or Button in the starting file')
             self.trigger = matches[0]['id']
-        elif any(e['triggers'] for e in trace.events):
+        elif any(e['kind'] in {'ui_input', 'ui_event'} for e in trace.events):
             raise ValueError('A UI scenario requires an explicit Question/Button trigger_eid')
         entries = {e['entry'] for e in trace.events}
         if len(entries) != 1:
