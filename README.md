@@ -116,7 +116,79 @@ contract row.
 evidence bundle. It follows assignments, conditions, component mappings and
 shared Rule references. It does not require `build` or a SQLite database.
 
-For a field in an application screen (replace these synthetic paths with your project):
+### Trace quick start
+
+Use `--field` to find the candidate definitions of a data item, or `--rule-eid`
+to inspect one rule and the execution evidence beneath it. Exactly one anchor is
+required unless the same information comes from `--request`.
+
+```bash
+ifp-contract trace COMPONENT_ROOT \
+  --file path/relative/to/COMPONENT_ROOT/Screen.ifp \
+  --field 'Form[1].Amount' \
+  --entry ProductName.PhaseName \
+  --output /tmp/amount-trace
+```
+
+When running directly from this repository without installing the package, use:
+
+```bash
+PYTHONPATH=src /home/colin/.venv/bin/python -m ifp_contract trace ...
+```
+
+The important options are:
+
+| Option | Meaning |
+| --- | --- |
+| `ROOT` | Component root. Every followed IFP must remain under this directory. |
+| `--file` | Starting IFP, relative to `ROOT`. |
+| `--field` | Data item or group to trace backwards. |
+| `--rule-eid` | Rule anchor; use instead of `--field`. |
+| `--entry` | `Product.Phase`, or `@eid` for an isolated shared rule. |
+| `--rules-config` | JSON extensions for API classes, methods, attributes and rule semantics. |
+| `--scenario` | JSON trigger and initial field assumptions used to eliminate contradicted branches. |
+| `--path-var NAME=PATH` | Explicit substitution for component paths such as `$$LIBRARY_HOME$`. Repeat as needed. |
+| `--max-files`, `--max-contexts` | Collection limits; partial results are retained when reached. |
+| `--cache-dir DIR` | Reuse content-verified source parsing data in `DIR`. |
+| `--no-cache` | Disable source-cache reuse for this run. |
+| `--strict` | Return status 2 when unresolved inputs or diagnostics remain. |
+| `--output` | New evidence directory; it must differ from `ROOT`. |
+
+### Scan the local Saba_corp Amount chain
+
+From `/home/colin/project/ifp-contract-slicer`, this command traces the local
+Amount backfill from `PayOverdue.Initialise`. It reads Saba_corp but does not
+modify it or create a database:
+
+```bash
+PYTHONPATH=src /home/colin/.venv/bin/python -m ifp_contract trace \
+  /home/colin/project/Saba_corp/corporate/Components \
+  --file BusinessModules/Loans/UI/LoanOverview/LoanOverview.ifp \
+  --field 'WorkingElements[1].PaymentDetails[1].Amount' \
+  --entry PayOverdue.Initialise \
+  --path-var LIBRARY_HOME=. \
+  --output /tmp/saba-corp-amount-trace
+```
+
+Read `summary.md` first, then use `report.md` for the complete conditions,
+mappings and source locations:
+
+```bash
+sed -n '1,200p' /tmp/saba-corp-amount-trace/summary.md
+```
+
+To repeat or edit the request, keep the same component root and use the generated
+`next.json`:
+
+```bash
+PYTHONPATH=src /home/colin/.venv/bin/python -m ifp_contract trace \
+  /home/colin/project/Saba_corp/corporate/Components \
+  --request /tmp/saba-corp-amount-trace/next.json \
+  --output /tmp/saba-corp-amount-trace-next
+```
+
+On Windows or another machine, replace the two absolute roots and use the
+installed `ifp-contract` command. The equivalent PowerShell shape is:
 
 ```powershell
 ifp-contract trace D:\ifp-project\components `
@@ -135,10 +207,16 @@ The output directory contains:
   and unresolved boundaries.
 - `evidence.json`: versioned structural evidence, raw behavioral attributes,
   exact mapping attributes, file offsets/lines, file fingerprints and separate
-  contexts for different calls and entries.
+  contexts for different calls and entries. Its `conclusions` section assesses
+  each anchor as `blocked`, `conditional`, or `static_candidate`. A blocked
+  result names the unknown rule, unresolved value, collection limit, or other
+  collected boundary that may change the conclusion. This is a conservative
+  static assessment, never a claim that the process ran or a value was observed.
 - `next.json`: an editable request containing the anchors, limits, path-variable
   substitutions, previous fingerprints and pending evidence. If a rules config
   was supplied, a copy is included as `rules-config.json`.
+- `performance.json`: reached file/byte counts, cache hits and elapsed time for
+  collection, slicing and report export.
 
 These files can be moved out of an isolated network for analysis. Follow-up
 requests can add entries to `targets`, refine an `entry`, or increase limits.
@@ -240,7 +318,8 @@ existing class requires `"override": true`. Duplicate classes, unknown keys,
 ambiguous attribute mappings and invalid branch definitions fail validation.
 `branch_attribute` names the attribute on the condition's **children**;
 `branches` maps project labels to JSON booleans, e.g. `{"pass": true, "fail": false}`.
-Unrecognized labels on an extended evaluation remain unresolved guards.
+Unrecognized labels on any evaluation remain unresolved guards and produce an
+`UNKNOWN_BRANCH` diagnostic. They are never treated as unconditional children.
 
 The legacy `trace_rule_kinds` setting remains supported for additive suffix
 aliases using the standard attributes. Evidence includes an effective semantics
@@ -249,6 +328,36 @@ into the bundle for offline replay. These extensions declare existing supported
 semantics, not arbitrary executable plugins. XML structure, expression syntax,
 component mapping format and engine-specific side effects are not universally
 configurable in this version.
+
+API class configuration has two explicit scopes. Existing `api_rule_classes`,
+`method_by_rule_class_suffix`, and `api_rule_attributes` entries match class
+suffixes and remain backward compatible even when their keys contain package
+names. Use `api_rule_classes_exact`, `method_by_rule_class`, and
+`api_rule_attributes_exact` when two packages contain the same Rule suffix:
+
+```json
+{
+  "api_rule_classes_exact": ["vendor_a.FetchRule", "vendor_b.FetchRule"],
+  "method_by_rule_class": {
+    "vendor_a.FetchRule": "GET",
+    "vendor_b.FetchRule": "POST"
+  },
+  "api_rule_attributes_exact": {
+    "vendor_a.FetchRule": {"path": ["ReadPath"]},
+    "vendor_b.FetchRule": {"path": ["WritePath"]}
+  }
+}
+```
+
+Exact matches take precedence over suffix fallbacks. A method written on the
+Rule still takes precedence over either class mapping. Project aliases normally
+follow the built-in aliases. To explicitly prefer a project attribute, use
+`api_rule_attribute_overrides` for suffix scope or
+`api_rule_attribute_overrides_exact` for one qualified class. Duplicate
+normalized suffix mappings and API/behavioral classification conflicts fail
+validation instead of silently selecting one value. Trace API evidence records
+whether its class and method matched an exact entry, a suffix fallback, or an
+explicit Rule attribute.
 
 ### Explain a specific scenario
 
@@ -271,6 +380,12 @@ instances, loops, resets, unknown effects and unresolved conditional writes
 remain unknown. A later known assignment replaces the initial assumed value.
 Constants are not propagated between separate UI events. Symbolic mapping
 indices are not treated as concrete array instances.
+
+EvaluateRule dependency collection recognizes both `$$Form[1].Mode$` and a
+plain condition operand such as `Form[1].Mode`. Quoted dotted strings remain
+literals. Dependency extraction is recorded separately from scenario
+evaluation, so an unsupported comparison can still retain its input fields
+while its truth value remains unknown.
 
 The scenario is an overlay: **excluded paths remain in the original evidence**.
 Events are labeled `candidate`, `excluded` (with the excluding condition IDs),
@@ -361,6 +476,120 @@ Exit status is `0` for successful collection (which can include unresolved
 evidence), `1` for file/collection errors, `2` with `--strict` when issues or
 external inputs remain, and `130` for interruption. Interruption can be retried
 from the same command/request; there is no trace checkpoint database.
+
+### Trace summaries and performance
+
+`trace` follows references from the selected entry; it does not enumerate the
+entire project. A 4 GB root therefore does not imply reading 4 GB for each
+question. Work and memory still grow with the reachable files, expanded rule
+contexts and exported dependencies. `inspect` and `build` perform corpus scans
+and have different scaling behavior. Keep `--entry` and the target field/rule
+specific; a limit warning means incomplete evidence, not a completed analysis.
+
+The CLI now reuses a source cache by default in
+`$XDG_CACHE_HOME/ifp-contract/trace` (or `~/.cache/ifp-contract/trace`). Use
+`--cache-dir /tmp/ifp-trace-cache` to select its location, or `--no-cache` to
+disable it and release large rule attributes after traversal. The Python
+`Trace` API enables reuse only when `cache_dir=Path(...)` is supplied.
+Every lookup hashes the complete reached source file and checks its metadata;
+changed content, parser cache version, or structural metadata configuration
+invalidates reuse. Cached attributes and diagnostics do not merge entry contexts.
+Broken or unwritable cache entries fall back to parsing. Cache files contain
+source-derived data and can be deleted to reclaim space; old content versions
+are not automatically evicted.
+
+Each command writes `performance.json` with per-target reached bytes/files,
+cache hits, collection, slicing and cache-write times, plus export and total
+time. `source_seconds` is a subset of `collection_seconds`, not an additional
+stage. Timing data stays separate from deterministic evidence.
+
+Trace summaries show representative data-source chains from the target to the
+first API on each chain. They keep separate API event contexts, show at most 12
+source chains, and group diagnostics by code. API request dependencies remain in
+the complete evidence without being presented as additional direct value
+sources. Long paths explicitly mark omitted intermediate events. Before the
+chains, `summary.md` renders the per-anchor conclusion assessment from
+`evidence.json`: `blocked` identifies a boundary that can alter the conclusion;
+`conditional` records compatible but prerequisite-dependent paths; and
+`static_candidate` means no such boundary was found in the collected scope. No
+status substitutes for an observed runtime execution.
+
+`AddToListRule`, `CompareMultiListValuesRule`, and `SetQuestionStatus` retain
+`UNKNOWN_RULE` boundaries but now include `partial_semantics` evidence. Explicit
+list key/value data-item inputs and error outputs are connected to the field
+graph. Named lists and UI targets are not treated as datastore writes;
+`NewListValues` remains ambiguous rather than being assumed to be a comparison
+result or a proven assignment. Raw UI state flags do not prove a runtime effect.
+
+The slicer indexes writers by scope and field/group path, then checks concrete
+array instances and branch compatibility. It deduplicates queued demands and
+edges while preserving evidence order. The Saba international-payment benchmark
+fell from 165.56 seconds to 12.16 seconds on the same host (18 files and 11,195
+contexts, no truncation). Performance-only changes were also checked against the
+original complete slice, including list ordering.
+
+A subsequent parser/report optimization and source cache reduced the same
+complex trace to about 4 seconds on an empty application cache and 1.2 seconds
+on reuse. A 4.74 GB logical directory of real Saba files plus unreferenced
+hardlink replicas took about 4.9 seconds with caching disabled, versus 4.8
+seconds for the original root. Both reached only 18 files (24,042,983 bytes).
+This verifies independence from unrelated directory contents; it does not
+benchmark a production trace whose reachable dependency graph itself is 4 GB.
+All four existing bundle artifacts were byte-identical to the pre-optimization
+baseline, with no evidence truncation.
+
+## Inspect project compatibility before tracing
+
+`inspect` scans one IFP file or a component directory without a database. It
+reports which Rule classes have known behavior, which classes are only
+recognized by name, unknown branch labels, missing semantic attributes, API
+alias conflicts, and unresolved component selectors. It never invents behavior
+for an unknown Rule.
+
+```bash
+ifp-contract inspect COMPONENT_ROOT \
+  --rules-config project-rules.json \
+  --path-var LIBRARY_HOME=. \
+  --output /tmp/ifp-compatibility
+```
+
+Use `--max-files` to bound a large corpus and `--max-samples` to limit source
+examples retained for each finding. `--quiet` suppresses progress messages. The
+output directory contains:
+
+- `compatibility.md`: readable coverage, class census, findings and actions.
+- `compatibility.json`: versioned machine-readable evidence and file hashes.
+- `rules-config.draft.json`: the supplied valid configuration, or `{}`; unknown
+  classes are deliberately not guessed into it.
+- `adaptation-todo.md`: a short checklist with representative source locations.
+
+For the local Saba_corp component tree, run the following from this repository.
+The output remains under `/tmp` and may contain project class names and source
+locations, so it should be treated as local analysis evidence:
+
+```bash
+PYTHONPATH=src /home/colin/.venv/bin/python -m ifp_contract inspect \
+  /home/colin/project/Saba_corp/corporate/Components \
+  --rules-config examples/temenos-odata-config.json \
+  --path-var LIBRARY_HOME=. \
+  --output /tmp/saba-corp-ifp-compatibility
+```
+
+Class recognition is not a claim of complete read/write semantics. Inspection
+is static, does not observe runtime execution, and does not validate Windows
+paths on a native Windows host. A partial scan states its file limit and keeps
+the evidence already collected. Exit status is `1` for file-read or directory
+enumeration errors, including when a partial report was saved; compatibility
+warnings and a configured file limit alone do not change the exit status.
+
+Shared `LinkReference` nodes are checked for missing or ambiguous targets rather
+than being required to repeat the target's selector or HTTP method. The target
+rules themselves are inspected normally. Trace and inspection share component
+selector precedence and disabled-state handling (`y`, `true`, `1`, `yes`, `on`,
+case-insensitive with surrounding whitespace ignored). Explicit trace attribute
+mappings keep their existing case-sensitive names, replace the original
+attribute even when absent, and may use configured defaults. Disabled ancestors
+are respected when tracing an isolated shared rule as well.
 
 ## Storage contract
 

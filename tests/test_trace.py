@@ -277,3 +277,45 @@ def test_instance_setter_reads_the_saved_index(tmp_path):
     restore, save = event(data, 'restore index'), event(data, 'save index')
     assert any(e['from'] == save['id'] and e['to'] == restore['id'] for e in data['edges'])
     assert save['reads'][0]['path'] == '@instance:Accounts[C]'
+
+
+def test_plain_condition_field_is_a_dependency_but_quoted_dotted_text_is_not(tmp_path):
+    put(tmp_path, 'A.ifp', '''<Project><Product Name="P"><Phase Name="I">
+      <Rule Name="mode" RuleClassName="SetValueRule" PropertyName="Form[1].Mode" FromValue="Ready"/>
+      <Rule Name="gate" RuleClassName="EvaluateRule" Expression="Form[1].Mode == 'release.v1'">
+        <Rule Name="fill" RuleClassName="SetValueRule" PropertyName="Target" FromValue="1" RuleType="True"/>
+      </Rule>
+    </Phase></Product></Project>''')
+    data = Trace(tmp_path).collect('A.ifp', 'Target', None, 'P.I')
+    gate = event(data, 'gate')
+    assert [read['path'] for read in gate['reads']] == ['Form[1].Mode']
+    assert gate['condition_dependencies']['status'] == 'lexically_extracted'
+    assert 'mode' in {item['name'] for item in data['events']}
+
+
+def test_unknown_standard_branch_is_retained_as_an_unknown_guard(tmp_path):
+    put(tmp_path, 'A.ifp', '''<Project><Product Name="P"><Phase Name="I">
+      <Rule Name="old" RuleClassName="SetValueRule" PropertyName="Target" FromValue="old"/>
+      <Rule Name="gate" RuleClassName="EvaluateRule" Expression="$$Mode$ == 'Ready'">
+        <Rule Name="maybe" RuleClassName="SetValueRule" PropertyName="Target" FromValue="new" RuleType="true"/>
+      </Rule>
+      <Rule Name="use" RuleClassName="SetValueRule" PropertyName="Result" FromType="Data Item" FromPropertyName="Target"/>
+    </Phase></Product></Project>''')
+    data = Trace(tmp_path).collect('A.ifp', 'Result', None, 'P.I')
+    maybe = event(data, 'maybe')
+    assert maybe['guards'][0]['status'] == 'unknown_branch_label'
+    assert maybe['guards'][0]['branch'] == 'true'
+    assert any(issue['code'] == 'UNKNOWN_BRANCH' and issue['label'] == 'true'
+               for issue in data['issues'])
+    assert {'old', 'maybe', 'use'} <= {item['name'] for item in data['events']}
+
+
+def test_unsupported_assignment_type_is_an_explicit_boundary(tmp_path):
+    put(tmp_path, 'A.ifp', '''<Project><Product Name="P"><Phase Name="I">
+      <Rule Name="session write" eid="session-write" RuleClassName="SetValueRule"
+        Type="Http Session Variable" HttpSessionVariableName="Token" FromValue="value"/>
+    </Phase></Product></Project>''')
+    data = Trace(tmp_path).collect('A.ifp', None, 'session-write', 'P.I')
+    assert any(issue['code'] == 'UNSUPPORTED_ASSIGNMENT_TARGET_TYPE'
+               and issue['target_type'] == 'Http Session Variable' for issue in data['issues'])
+    assert not event(data, 'session write')['writes']

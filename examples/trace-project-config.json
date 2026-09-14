@@ -20,6 +20,6 @@
       }
     ]
   },
-  "api_rule_classes": ["my.company.FetchRule"],
-  "method_by_rule_class_suffix": {"FetchRule": "GET"}
+  "api_rule_classes_exact": ["my.company.FetchRule"],
+  "method_by_rule_class": {"my.company.FetchRule": "GET"}
 }

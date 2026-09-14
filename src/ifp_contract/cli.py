@@ -82,7 +82,22 @@ def _parser() -> argparse.ArgumentParser:
     trace.add_argument("--path-var", action="append", help="explicit component path substitution, e.g. LIBRARY_HOME=.")
     trace.add_argument("--max-files", type=int)
     trace.add_argument("--max-contexts", type=int)
+    cache = trace.add_mutually_exclusive_group()
+    cache.add_argument("--cache-dir", type=Path, help="content-verified source cache (default: user cache directory)")
+    cache.add_argument("--no-cache", action="store_true", help="disable reusable trace source cache")
     trace.add_argument("--strict", action="store_true")
+
+    inspect = commands.add_parser(
+        "inspect", help="inspect project compatibility for trace without a database"
+    )
+    inspect.add_argument("root", type=Path, help="IFP corpus folder or one IFP file")
+    inspect.add_argument("--rules-config", type=Path)
+    inspect.add_argument("--path-var", action="append", help="component path substitution, e.g. LIBRARY_HOME=.")
+    inspect.add_argument("--max-files", type=int, default=10_000)
+    inspect.add_argument("--max-samples", type=int, default=5)
+    inspect.add_argument("--quiet", action="store_true")
+    inspect.add_argument("--output", type=Path, required=True,
+                         help="directory for compatibility report and config draft")
     return parser
 
 
@@ -495,6 +510,16 @@ def main(argv: list[str] | None = None) -> int:
             return run_trace(args)
         except KeyboardInterrupt:
             print("INTERRUPTED: rerun the trace request", file=sys.stderr)
+            return 130
+        except (OSError, ValueError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+    if args.command == "inspect":
+        from .inspect import run_inspect
+        try:
+            return run_inspect(args)
+        except KeyboardInterrupt:
+            print("INTERRUPTED: rerun the compatibility inspection", file=sys.stderr)
             return 130
         except (OSError, ValueError) as error:
             print(f"ERROR: {error}", file=sys.stderr)

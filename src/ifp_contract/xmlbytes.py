@@ -11,6 +11,7 @@ import codecs
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from html import unescape
 from pathlib import Path
 from typing import BinaryIO
@@ -451,6 +452,11 @@ class AttributeRead:
     matched_references: set[str] = field(default_factory=set)
 
 
+@lru_cache(maxsize=16)
+def _attribute_name_delimiters(encoding: XMLByteEncoding) -> re.Pattern[bytes]:
+    return re.compile(b"|".join(re.escape(encoding.encode(c)) for c in "= \t\r\n/>"))
+
+
 def read_tag_attributes(
     path: str | Path,
     span: XMLTagSpan,
@@ -470,6 +476,7 @@ def read_tag_attributes(
     enc = encoding or detect_xml_encoding(file_path)
     unit = enc.unit
     result = AttributeRead()
+    name_delimiters = _attribute_name_delimiters(enc)
     state = "open"
     name = bytearray()
     value = bytearray()
@@ -528,6 +535,20 @@ def read_tag_attributes(
             remaining -= len(block)
             index = 0
             while index < len(block):
+                if state == "name":
+                    # Generated mapping names can be hundreds of bytes long.
+                    # Scan runs in C, retaining the same bounded name and byte
+                    # alignment as the incremental parser (including UTF-16).
+                    match = name_delimiters.search(block, index)
+                    while match is not None and (position + match.start()) % unit:
+                        match = name_delimiters.search(block, match.start() + 1)
+                    stop = match.start() if match is not None else len(block)
+                    if stop > index:
+                        available = max(0, 4096 - len(name))
+                        name.extend(block[index:min(stop, index + available)])
+                        index = stop
+                        if index == len(block):
+                            break
                 if state == "quoted_value":
                     # Skip/capture runs of bytes, including values that are not
                     # selected. Decode only the bounded captured value.

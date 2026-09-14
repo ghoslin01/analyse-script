@@ -8,12 +8,17 @@ from collections import deque
 import json
 from pathlib import Path
 import re
+from time import perf_counter
 
 from .config import load_rule_config
-from .extractor import mappings_from_attributes, _value, _value_ending_with, rule_base_url
+from .extractor import mappings_from_attributes, _value, rule_base_url
 from .trace_source import TraceNode, TraceSource
 from .trace_config import TraceConfig, STANDARD_KINDS, ATTRIBUTES
-from .templates import field_references, template_evidence
+from .trace_index import TraceIndex
+from .behavior import effective_disabled, selector_value
+from .trace_partial import partial_rule_evidence
+from .trace_assessment import assess_conclusions, evidence_closures
+from .templates import condition_references, field_references, template_evidence
 
 
 KINDS = STANDARD_KINDS
@@ -78,12 +83,16 @@ def project_read(read: dict, written: dict, demand: dict) -> dict:
 class Trace:
     def __init__(self, root: Path, *, rules_config: Path | None = None,
                  path_variables: dict[str, str] | None = None,
-                 max_files: int = 50, max_contexts: int = 5000):
+                 max_files: int = 50, max_contexts: int = 5000,
+                 cache_dir: Path | None = None):
         self.root = root.resolve()
         self.config = load_rule_config(rules_config)
         self.semantics = TraceConfig(rules_config)
         for name in self.semantics.rules:
             if self.config.is_api_rule(name):
+                raise ValueError(f'Conflicting API and trace semantics for {name}')
+        for name in self.config.exact_api_rule_classes:
+            if self.semantics.resolve(name)['kind'] != 'unknown':
                 raise ValueError(f'Conflicting API and trace semantics for {name}')
         self.scenario = None
         self.path_variables = path_variables or {}
@@ -97,6 +106,9 @@ class Trace:
         self.failed = False
         self.limited = False
         self.current_entry = ''
+        self.disabled_cache: dict[str, bool] = {}
+        self.cache_dir = cache_dir
+        self.performance = {'source_seconds': 0.0}
 
     def issue(self, code: str, **details):
         item = {'code': code, **details}
@@ -116,7 +128,10 @@ class Trace:
             self.issue('FILE_LIMIT', file=key)
             return None
         try:
-            result = TraceSource(self.root, path, extra_metadata=self.semantics.extra_metadata)
+            started = perf_counter()
+            result = TraceSource(self.root, path, extra_metadata=self.semantics.extra_metadata,
+                                 cache_dir=self.cache_dir)
+            self.performance['source_seconds'] += perf_counter() - started
             self.sources[key] = result
             return result
         except (OSError, ValueError) as error:
@@ -192,12 +207,17 @@ class Trace:
         spec = self.semantics.resolve(full_class)
         a = self.semantics.normalize(raw, spec) if node.tag == 'Rule' else raw
         kind = spec['kind'] if node.tag == 'Rule' else 'structure'
+        if kind == 'call':
+            a['SelectComponent'] = selector_value(
+                raw, spec, self.config.attribute_names_for_rule(full_class, 'selector'),
+                self.semantics.normalize) or ''
         if node.tag in {'Question', 'Button'}:
             kind = 'ui_event'
             if (node.tag == 'Question' and a.get('PropertyKey') and
                 not any(a.get(k, '').casefold() in {'y', 'true'} for k in ('ReadOnly', 'DisableInput'))):
                 kind = 'ui_input'
-        if a.get('RuleDisabled', '').casefold() in {'y', 'true'}:
+        if effective_disabled(node, source.attributes, self.semantics.resolve,
+                              self.semantics.normalize, self.disabled_cache):
             self.event(source, node, scope, 'disabled', guards, loops, parents, a)
             return
         ev = self.event(source, node, scope, kind, guards, loops, parents, raw)
@@ -225,6 +245,15 @@ class Trace:
         def add_reads(expression):
             ev['reads'].extend(self.field(scope, p, p.endswith(']')) for p in refs(expression))
 
+        def add_condition_reads(expression):
+            paths = condition_references(expression)
+            ev['reads'].extend(self.field(scope, p, p.endswith(']')) for p in paths)
+            ev['condition_dependencies'] = {
+                'status': 'lexically_extracted', 'fields': paths,
+                'completeness': 'best_effort_not_proven',
+                'expression_evaluation': 'separate_and_may_be_unsupported',
+            }
+
         if a.get('ConditionExpression'):
             ev['ui_condition'] = {'expression': a['ConditionExpression'],
                                   'not_applicable': a.get('NotApplicable'),
@@ -234,7 +263,10 @@ class Trace:
             ev['writes'].append(self.field(scope, a['PropertyKey']))
             ev['value_origin'] = 'user_or_existing_ui_value'
         if kind in {'evaluate', 'expression'}:
-            add_reads(a.get('Expression', ''))
+            if kind == 'evaluate':
+                add_condition_reads(a.get('Expression', ''))
+            else:
+                add_reads(a.get('Expression', ''))
             if kind == 'expression' and a.get('OutputProperty'):
                 ev['writes'].append(self.field(scope, a['OutputProperty']))
         elif kind == 'set':
@@ -242,15 +274,23 @@ class Trace:
             ev['assignment_modes'] = {'target': typ, 'source': from_type,
                                       'source_defaulted': 'FromType' not in a,
                                       'target_defaulted': 'Type' not in a}
-            target = a.get({'Variable': 'VariableName', 'Data Group': 'PropertyGroupName',
-                            'Data Group Instance': 'PropertyGroupInstanceName'}.get(typ, 'PropertyName'), '')
+            target_keys = {'Data Item': 'PropertyName', 'Variable': 'VariableName',
+                           'Data Group': 'PropertyGroupName',
+                           'Data Group Instance': 'PropertyGroupInstanceName'}
+            target_key = target_keys.get(typ)
+            if target_key is None:
+                self.issue('UNSUPPORTED_ASSIGNMENT_TARGET_TYPE', event=ev['id'], target_type=typ)
+            target = a.get(target_key, '') if target_key else ''
             if target:
                 prefix = '!' if typ == 'Variable' else '@instance:' if typ == 'Data Group Instance' else ''
                 ev['writes'].append(self.field(scope, prefix + target,
                                                typ == 'Data Group'))
-            source_key = {'Data Item': 'FromPropertyName', 'Variable': 'FromVariableName',
-                          'Data Group': 'FromPropertyGroupName',
-                          'Data Group Instance': 'FromPropertyGroupInstanceName'}.get(from_type)
+            source_keys = {'Value': None, 'Data Item': 'FromPropertyName',
+                           'Variable': 'FromVariableName', 'Data Group': 'FromPropertyGroupName',
+                           'Data Group Instance': 'FromPropertyGroupInstanceName'}
+            source_key = source_keys.get(from_type)
+            if from_type not in source_keys:
+                self.issue('UNSUPPORTED_ASSIGNMENT_SOURCE_TYPE', event=ev['id'], source_type=from_type)
             if source_key and a.get(source_key):
                 prefix = '!' if from_type == 'Variable' else '@instance:' if from_type == 'Data Group Instance' else ''
                 ev['reads'].append(self.field(scope, prefix + a[source_key],
@@ -285,11 +325,20 @@ class Trace:
         elif kind == 'goto':
             self.issue('PHASE_TRANSITION_BOUNDARY', event=ev['id'], phase=a.get('Phase'),
                        operation=a.get('OperationType'))
-        elif self.config.is_api_rule(cls):
+        elif self.config.is_api_rule(full_class):
             ev['kind'] = 'api'
             names = lambda concept: self.config.attribute_names_for_rule(full_class, concept)
-            method = (_value(a, *names('method')) or _value_ending_with(a, 'method')
-                      or self.config.method_for_rule_class(cls))
+            by_lower = {key.casefold(): (key, value) for key, value in a.items()}
+            explicit_method_item = next(
+                (by_lower[name.casefold()] for name in names('method')
+                 if name.casefold() in by_lower and by_lower[name.casefold()][1] != ''), None)
+            if explicit_method_item is None:
+                explicit_method_item = next(
+                    ((key, value) for key, value in a.items()
+                     if value and key.casefold().endswith('method')), None)
+            explicit_method = explicit_method_item[1] if explicit_method_item else None
+            method_resolution = self.config.method_resolution(full_class)
+            method = explicit_method or (method_resolution or {}).get('method')
             ev['api'] = {'method': method, 'path': _value(a, *names('path')),
                          'source': _value(a, *names('source')),
                          'base_url': rule_base_url(a, self.config),
@@ -300,6 +349,11 @@ class Trace:
                          'language': _value(a, *names('language')),
                          'context': _value(a, *names('context')),
                          'manual_payload': a.get('UseManualPayload')}
+            ev['api']['config_resolution'] = {
+                'rule_class': self.config.api_rule_resolution(full_class),
+                'method': ({'match': 'attribute', 'key': explicit_method_item[0],
+                            'method': explicit_method} if explicit_method else method_resolution),
+            }
             if ev['api']['base_url']:
                 ev['api']['base_url_evidence'] = {'origin': 'rule', 'file': source.relative,
                                                  'line': node.line, 'offset': node.offset}
@@ -347,6 +401,18 @@ class Trace:
             # Preserve all unknown-rule attributes, including unfamiliar underscored ones.
             if len(json.dumps(a).encode()) <= 128 * 1024:
                 self.nodes[node.key]['attributes'] = a.copy()
+                partial = partial_rule_evidence(full_class, a)
+                if partial:
+                    ev['partial_semantics'] = {'status': 'declared_attributes_only',
+                                               'runtime_behavior_verified': False,
+                                               **partial['evidence']}
+                    ev['semantics']['incomplete'] = True
+                    for key, paths in (('reads', partial['read_paths']),
+                                       ('writes', partial['write_paths'])):
+                        for path in paths:
+                            value = self.field(scope, path, path.endswith(']'))
+                            if value not in ev[key]:
+                                ev[key].append(value)
             else:
                 self.issue('RAW_EVIDENCE_LIMIT', event=ev['id'])
 
@@ -358,18 +424,22 @@ class Trace:
             branch_label = child.meta.get(spec.get('branch_attribute', 'RuleType'), '')
             branch_value = spec.get('branches', {'True': True, 'False': False}).get(branch_label)
             branch = 'True' if branch_value else 'False'
-            if kind == 'evaluate' and spec['origin'] == 'project_extension' and branch_value is None:
-                self.issue('UNKNOWN_BRANCH', event=ev['id'], label=branch_label, child=child.key)
+            if kind == 'evaluate' and branch_value is None:
+                self.issue('UNKNOWN_BRANCH', event=ev['id'], label=branch_label, child=child.key,
+                           file=source.relative, line=child.line,
+                           branch_attribute=spec.get('branch_attribute', 'RuleType'))
                 child_guards = [*guards, {'event': ev['id'], 'branch': branch_label,
-                                         'kind': 'rule_result', 'expression': None}]
+                                         'source_branch': branch_label,
+                                         'kind': 'unknown_condition',
+                                         'expression': a.get('Expression'),
+                                         'status': 'unknown_branch_label'}]
             if branch_value is not None and node.tag in {'Rule', 'Question', 'Button'}:
                 child_guards = [*guards, {'event': ev['id'], 'branch': branch,
                                 'source_branch': branch_label,
                                 'kind': 'condition' if kind == 'evaluate' else 'rule_result',
                                 'expression': a.get('Expression') if kind == 'evaluate' else None}]
             self.walk(source, child, scope, child_guards, child_loops, descendants, active)
-        # Attributes for reached rules can contain thousands of generated mapping entries.
-        node.attrs = None
+        source.release_attributes(node)
 
     def expand_call(self, source, node, a, ev, guards, loops, parents, active):
         selector = a.get('SelectComponent', '')
@@ -412,9 +482,10 @@ class Trace:
 
     def collect(self, file: str, field: str | None, rule_eid: str | None, entry: str | None,
                 scenario: dict | None = None):
+        started = perf_counter()
         source = self.source(self.root / file.replace('\\', '/'))
         if source is None:
-            return self.slice([], field)
+            return self._finish_collect([], field, started)
         roots = source.entry_roots(entry)
         if entry and len(roots) != 1:
             raise ValueError(f'Entry must resolve uniquely: {entry!r}')
@@ -453,70 +524,118 @@ class Trace:
                 self.issue('SCENARIO_NOT_EVALUATED', reason='incomplete_collection')
             else:
                 self.scenario = Scenario(self, scenario, source.relative).apply()
-        return self.slice(seeds, field)
+        return self._finish_collect(seeds, field, started)
+
+    def _finish_collect(self, seeds, field, started):
+        self.performance['collection_seconds'] = perf_counter() - started
+        sliced = perf_counter()
+        result = self.slice(seeds, field)
+        self.performance['slice_seconds'] = perf_counter() - sliced
+        cached = perf_counter()
+        if not self.failed:
+            for source in self.sources.values():
+                source.save_cache()
+        self.performance.update(
+            cache_write_seconds=perf_counter() - cached,
+            source_files=len(self.sources),
+            source_bytes=sum(s.before.st_size for s in self.sources.values()),
+            cache_hits=sum(s.cache_hit for s in self.sources.values()),
+        )
+        return result
 
     def slice(self, seeds, field):
         by_id = {e['id']: e for e in self.events}
+        index = TraceIndex(self.events, shape)
         selected: set[str] = set()
         partial = not seeds and (self.limited or self.failed)
-        queue = deque((eid, None) for eid in (by_id if partial else seeds))
-        processed = set()
+        queue = deque()
+        scheduled = set()
         edges, inputs = [], []
+        edge_keys, input_keys = set(), set()
+        opaque_by_target: dict[str, set[str]] = {}
+        writer_cache = {}
+
+        def read_key(read):
+            return tuple(sorted(read.items()))
+
+        def enqueue(eid, demand=None):
+            task = (eid, read_key(demand) if demand is not None else None)
+            if task not in scheduled:
+                scheduled.add(task)
+                queue.append((eid, demand))
+
+        def add_input(eid, read, status):
+            key = (eid, read_key(read), status)
+            if key not in input_keys:
+                input_keys.add(key)
+                inputs.append({'event': eid, 'field': read, 'status': status})
+
+        for eid in (by_id if partial else seeds):
+            enqueue(eid)
         while queue:
             eid, demand = queue.popleft()
-            task = (eid, json.dumps(demand, sort_keys=True))
-            if task in processed:
-                continue
-            processed.add(task)
             selected.add(eid)
             ev = by_id[eid]
-            queue.extend((p, None) for p in ev['parents'])
-            queue.extend((g['event'], None) for g in ev['guards'])
-            queue.extend((p, None) for p in ev['loops'])
+            for parent in ev['parents']:
+                enqueue(parent)
+            for guard in ev['guards']:
+                enqueue(guard['event'])
+            for loop in ev['loops']:
+                enqueue(loop)
             # Cursor-setting operations are dependencies of later field accesses.
-            for prior in self.events[:ev['sequence']]:
-                if prior['scope'] == ev['scope'] and prior['kind'] == 'instance' and compatible(prior, ev):
-                    queue.append((prior['id'], None))
-            for peer in self.events:
-                if peer['kind'] == 'instance' and peer['scope'] == ev['scope'] and set(peer['loops']) & set(ev['loops']) and compatible(peer, ev):
-                    queue.append((peer['id'], None))
+            for prior in index.instances.get(ev['scope'], ()):
+                if prior['sequence'] >= ev['sequence']:
+                    break
+                if index.compatible(prior, ev):
+                    enqueue(prior['id'])
+            for peer in index.instances.get(ev['scope'], ()):
+                if set(peer['loops']) & set(ev['loops']) and index.compatible(peer, ev):
+                    enqueue(peer['id'])
             reads = ev['reads']
             if demand and (ev['kind'] in {'input_mapping', 'output_mapping'} or
                            (ev['kind'] == 'set' and any(w.get('group') for w in ev['writes']))):
                 reads = [project_read(r, w, demand) for r in reads for w in ev['writes'] if overlaps(w, demand)]
             for read in reads:
-                writers = [p for p in self.events if p['id'] != eid and
-                           (p['sequence'] < ev['sequence'] or p['triggers'] != ev['triggers']) and compatible(p, ev)
-                           and any(overlaps(w, read) for w in p['writes'])]
-                # A definite, non-loop assignment/reset hides older definitions in
-                # this activation. Conditional and cross-event writes stay candidates.
-                barriers = [p['sequence'] for p in writers if p['kind'] in {'set', 'reset', 'expression'}
-                            and not p['loops'] and p['triggers'] == ev['triggers']
-                            and all(g in ev['guards'] for g in p['guards'])
-                            and any(w['path'] == read['path'] and not any(x in w['path'] for x in ('[C]', '[A]', '$$'))
-                                    for w in p['writes'])]
-                if barriers:
-                    writers = [p for p in writers if p['triggers'] != ev['triggers'] or p['sequence'] >= max(barriers)]
+                key = (eid, read_key(read))
+                writers = writer_cache.get(key)
+                if writers is None:
+                    writers = [p for p in index.candidates(read) if p['id'] != eid and
+                               (p['sequence'] < ev['sequence'] or p['triggers'] != ev['triggers'])
+                               and index.compatible(p, ev)
+                               and any(overlaps(w, read) for w in p['writes'])]
+                    # A definite, non-loop assignment/reset hides older definitions
+                    # in this activation. Conditional and cross-event writes stay candidates.
+                    barriers = [p['sequence'] for p in writers if p['kind'] in {'set', 'reset', 'expression'}
+                                and not p['loops'] and p['triggers'] == ev['triggers']
+                                and all(g in ev['guards'] for g in p['guards'])
+                                and any(w['path'] == read['path'] and not any(x in w['path'] for x in ('[C]', '[A]', '$$'))
+                                        for w in p['writes'])]
+                    if barriers:
+                        barrier = max(barriers)
+                        writers = [p for p in writers if p['triggers'] != ev['triggers'] or p['sequence'] >= barrier]
+                    writer_cache[key] = writers
                 for writer in writers:
-                    queue.append((writer['id'], read))
+                    enqueue(writer['id'], read)
                     edge = {'from': writer['id'], 'to': eid, 'field': read,
                                   'relation': 'candidate_definition' if len(writers) > 1 or writer['triggers'] != ev['triggers'] else 'definition',
                                   'event_order': 'unknown_between_ui_events' if writer['triggers'] != ev['triggers'] else 'configuration_order',
                                   'conditional': writer['triggers'] != ev['triggers'] or any(g not in ev['guards'] for g in writer['guards'])}
-                    if edge not in edges:
+                    edge_key = (writer['id'], eid, read_key(read), edge['relation'],
+                                edge['event_order'], edge['conditional'])
+                    if edge_key not in edge_keys:
+                        edge_keys.add(edge_key)
                         edges.append(edge)
                 if not writers:
-                    item = {'event': eid, 'field': read, 'status': 'external_or_unresolved'}
-                    if item not in inputs:
-                        inputs.append(item)
+                    add_input(eid, read, 'external_or_unresolved')
                 elif all(p['triggers'] != ev['triggers'] or any(g not in ev['guards'] for g in p['guards']) for p in writers):
-                    item = {'event': eid, 'field': read, 'status': 'conditional_write_or_prior_value'}
-                    if item not in inputs:
-                        inputs.append(item)
+                    add_input(eid, read, 'conditional_write_or_prior_value')
             # An opaque preceding rule may affect the value. Do not silently skip it.
-            for prior in self.events[:ev['sequence']]:
-                if prior['scope'] == ev['scope'] and prior['kind'] in {'unknown', 'goto'} and compatible(prior, ev):
-                    queue.append((prior['id'], None))
+            for prior in index.opaque.get(ev['scope'], ()):
+                if prior['sequence'] >= ev['sequence']:
+                    break
+                if index.compatible(prior, ev):
+                    enqueue(prior['id'])
+                    opaque_by_target.setdefault(eid, set()).add(prior['id'])
         if not seeds:
             self.issue('ANCHOR_NOT_FOUND', field=field)
         events = [e for e in self.events if e['id'] in selected]
@@ -527,15 +646,28 @@ class Trace:
             scenario = {**self.scenario,
                         'conditions': [c for c in self.scenario['conditions'] if c['event'] in selected],
                         'classifications': [c for c in self.scenario['classifications'] if c['event'] in selected]}
+        coverage = {'files_read': len(self.sources), 'contexts_examined': len(self.events),
+                    'contexts_exported': len(events), 'limited': self.limited,
+                    'partial_scope_only': partial, 'runtime_verified': False}
+        # The slicer considers opaque predecessors for every field demand.  Keep
+        # only those that reach an anchor through its final evidence closure;
+        # this avoids exporting a quadratic internal work list.
+        closures = evidence_closures(events, edges, seeds)
+        order = {event['id']: event['sequence'] for event in events}
+        opaque_dependencies = []
+        for seed, closure in closures.items():
+            sources = set().union(*(opaque_by_target.get(event_id, set()) for event_id in closure))
+            for source in sorted(sources, key=order.get):
+                opaque_dependencies.append({'from': source, 'to': seed,
+                                            'relation': 'opaque_rule_may_affect_anchor'})
+        conclusions = assess_conclusions(events, edges, inputs, issues, seeds, coverage,
+                                         opaque_dependencies, scenario)
         return {'schema_version': 1, 'analysis': 'static_candidates', 'seeds': seeds,
                 'configuration': {'trace_semantics_sha256': self.semantics.signature,
                                   'api_rules': self.config.signature_payload()},
                 'scenario': scenario,
                 'events': events, 'nodes': {k: v for k, v in self.nodes.items() if k in node_keys},
-                'edges': edges, 'inputs': inputs, 'issues': issues,
-                'coverage': {'files_read': len(self.sources), 'contexts_examined': len(self.events),
-                             'contexts_exported': len(events), 'limited': self.limited,
-                             'partial_scope_only': partial,
-                             'runtime_verified': False},
+                'edges': edges, 'opaque_dependencies': opaque_dependencies, 'inputs': inputs,
+                'issues': issues, 'conclusions': conclusions, 'coverage': coverage,
                 'files': {s.relative: {'sha256': s.sha256, 'size': s.before.st_size}
                           for s in self.sources.values()}}

@@ -163,7 +163,7 @@ def _value_ending_with(attributes: dict[str, str], *suffixes: str) -> str | None
 def _api_classification(
     attributes: dict[str, str], rule_config: RuleConfig = DEFAULT_RULE_CONFIG
 ) -> str | None:
-    rule_class = _rule_suffix(_value(attributes, "RuleClassName", "ClassType"))
+    rule_class = _value(attributes, "RuleClassName", "ClassType")
     if rule_config.is_api_rule(rule_class):
         return "CONFIRMED"
     method = _value(attributes, *rule_config.attribute_names_for_rule(rule_class, "method")) or _value_ending_with(

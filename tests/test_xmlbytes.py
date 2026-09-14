@@ -116,3 +116,25 @@ def test_visible_dense_matches_match_expected_offsets_across_sections(tmp_path):
     expected = [index for index in range(len(content)) if content.startswith(b'<Rule Name=', index)]
     matches = list(iter_xml_visible_matches(path, ("<Rule", "<Product", "<Phase"), chunk_size=73))
     assert [match.offset for match in matches] == expected
+
+
+@pytest.mark.parametrize('codec,bom', [('utf-8', b''), ('utf-16-le', b'\xff\xfe'), ('utf-16-be', b'\xfe\xff')])
+@pytest.mark.parametrize('chunk_size', [2, 6, 14, 65536])
+def test_attribute_names_cross_chunks_and_preserve_unicode_and_duplicates(tmp_path, codec, bom, chunk_size):
+    # These UTF-16 characters can form delimiter bytes at an unaligned offset.
+    key = 'Mapping_\u3d00\u003d'.replace('=', '') + '字段😀_' + 'x' * 300
+    path = tmp_path / 'names.ifp'
+    path.write_bytes(bom + f'<Rule {key} = "first" Ignored="skip" {key}="second&amp;"/>'.encode(codec))
+    span = find_tag_span(path, len(bom), containing=False)
+    result = read_tag_attributes(path, span, lambda name: name == key, chunk_size=chunk_size)
+    assert result.values == {key: 'second&'}
+    assert result.duplicates == [key]
+
+
+@pytest.mark.parametrize('suffix', ['/>', ' other="value"/>'])
+def test_long_attribute_without_value_still_fails(tmp_path, suffix):
+    path = tmp_path / 'broken-name.ifp'
+    path.write_text('<Rule ' + 'x' * 300 + suffix, encoding='utf-8')
+    span = find_tag_span(path, 0, containing=False)
+    with pytest.raises(MalformedXMLStructure):
+        read_tag_attributes(path, span, lambda _: True, chunk_size=14)
